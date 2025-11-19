@@ -257,7 +257,7 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, default=256) # Smaller image size for Pokemon
     parser.add_argument("--num-classes", type=int, default=1) # Single class for now
     parser.add_argument("--epochs", type=int, default=1000)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=10)
