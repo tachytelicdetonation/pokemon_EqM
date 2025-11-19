@@ -12,6 +12,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../ref'
 
 from models import EqM_models
 from diffusers.models import AutoencoderKL
+from transport import create_transport, Sampler
 
 def main(args):
     # Setup device
@@ -88,32 +89,73 @@ def main(args):
         if args.sampler == 'ngd':
             m = m.detach()
 
-        # Sampling loop (Gradient Descent)
-        # Only use no_grad if we are not using an EBM (which requires gradients)
-        context = torch.no_grad() if args.ebm == 'none' else torch.enable_grad()
-        with context:
-            for step in range(args.num_sampling_steps):
-                if args.sampler == 'gd':
-                    out = model_fn(xt, t, y, args.cfg_scale) if args.cfg_scale > 1.0 else model_fn(xt, t, y)
-                    if isinstance(out, tuple): out = out[0]
-                elif args.sampler == 'ngd':
-                    x_ = xt + args.stepsize * m * args.mu
-                    out = model_fn(x_, t, y, args.cfg_scale) if args.cfg_scale > 1.0 else model_fn(x_, t, y)
-                    if isinstance(out, tuple): out = out[0]
-                    m = out
-                
-                xt = xt + out * args.stepsize
-                # t += args.stepsize # Time conditioning might be fixed or evolving? In EqM paper, it's equilibrium, so t might not matter or be fixed.
-                # Ref code: t += args.stepsize. But wait, EqM is equilibrium, so maybe t is just a dummy or used for annealing?
-                # Ref code: t += args.stepsize
-                # Let's follow ref code.
-                t += args.stepsize
-                
-                # Detach intermediate results to save memory if not needing gradients for next step (usually true for sampling)
-                # Even with EBM, we usually take a step and then detach for the next iteration unless we are doing BPTT through time (unlikely here)
-                xt = xt.detach()
-                if args.sampler == 'ngd':
-                    m = m.detach()
+        # Sampling loop
+        if args.sampler in ['gd', 'ngd']:
+            # Gradient Descent / Nesterov Accelerated Gradient
+            context = torch.no_grad() if args.ebm == 'none' else torch.enable_grad()
+            with context:
+                for step in range(args.num_sampling_steps):
+                    if args.sampler == 'gd':
+                        out = model_fn(xt, t, y, args.cfg_scale) if args.cfg_scale > 1.0 else model_fn(xt, t, y)
+                        if isinstance(out, tuple): out = out[0]
+                    elif args.sampler == 'ngd':
+                        x_ = xt + args.stepsize * m * args.mu
+                        out = model_fn(x_, t, y, args.cfg_scale) if args.cfg_scale > 1.0 else model_fn(x_, t, y)
+                        if isinstance(out, tuple): out = out[0]
+                        m = out
+                    
+                    xt = xt + out * args.stepsize
+                    # t += args.stepsize # Time conditioning might be fixed or evolving? In EqM paper, it's equilibrium, so t might not matter or be fixed.
+                    # Ref code: t += args.stepsize. But wait, EqM is equilibrium, so maybe t is just a dummy or used for annealing?
+                    # Ref code: t += args.stepsize
+                    # Let's follow ref code.
+                    t += args.stepsize
+                    
+                    # Detach intermediate results to save memory if not needing gradients for next step (usually true for sampling)
+                    # Even with EBM, we usually take a step and then detach for the next iteration unless we are doing BPTT through time (unlikely here)
+                    xt = xt.detach()
+                    if args.sampler == 'ngd':
+                        m = m.detach()
+
+        elif args.sampler.startswith('ode'):
+            transport = create_transport(
+                args.path_type,
+                args.prediction,
+                args.loss_weight,
+                args.train_eps,
+                args.sample_eps
+            )
+            sampler = Sampler(transport)
+            
+            if args.sampler == 'ode_dopri5':
+                sample_fn = sampler.sample_ode(sampling_method='dopri5', num_steps=args.num_sampling_steps)
+            elif args.sampler == 'ode_euler':
+                sample_fn = sampler.sample_ode(sampling_method='euler', num_steps=args.num_sampling_steps)
+            elif args.sampler == 'ode_heun':
+                sample_fn = sampler.sample_ode(sampling_method='heun', num_steps=args.num_sampling_steps)
+            else:
+                raise ValueError(f"Unknown ODE sampler: {args.sampler}")
+            
+            model_kwargs = dict(y=y)
+            if args.cfg_scale > 1.0:
+                model_kwargs['cfg_scale'] = args.cfg_scale
+                model_fn = model.forward_with_cfg
+            else:
+                model_fn = model.forward
+            
+            # ODE sampler expects model to be (x, t, **kwargs) -> output
+            # And it returns the trajectory or final sample?
+            # transport.sample_ode returns a function that returns samples
+            # The sample function returns 'samples' which is output of odeint
+            # odeint returns tensor of shape (n_steps, batch, ...)
+            
+            # We need to pass initial condition z
+            # z shape: (B, C, H, W)
+            
+            # sample_fn signature: sample(x, model, **model_kwargs)
+            
+            traj = sample_fn(z, model_fn, **model_kwargs)
+            xt = traj[-1] # Final state
 
         if args.cfg_scale > 1.0:
             xt, _ = xt.chunk(2, dim=0)
@@ -143,10 +185,17 @@ if __name__ == "__main__":
     parser.add_argument("--stepsize", type=float, default=0.0017)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--output-dir", type=str, default="generated_samples")
-    parser.add_argument("--sampler", type=str, default='gd', choices=['gd', 'ngd'])
+    parser.add_argument("--sampler", type=str, default='gd', choices=['gd', 'ngd', 'ode_dopri5', 'ode_euler', 'ode_heun'])
     parser.add_argument("--mu", type=float, default=0.3)
     parser.add_argument("--uncond", type=bool, default=False)
     parser.add_argument("--ebm", type=str, choices=["none", "l2", "dot", "mean"], default="none")
+    
+    # Transport args
+    parser.add_argument("--path-type", type=str, default="Linear", choices=["Linear", "GVP", "VP"])
+    parser.add_argument("--prediction", type=str, default="velocity", choices=["velocity", "score", "noise"])
+    parser.add_argument("--loss-weight", type=str, default="velocity", choices=[None, "velocity", "likelihood"])
+    parser.add_argument("--sample-eps", type=float, default=0.001)
+    parser.add_argument("--train-eps", type=float, default=0.001)
     
     args = parser.parse_args()
     main(args)

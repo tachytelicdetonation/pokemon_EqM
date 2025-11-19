@@ -91,9 +91,105 @@ class LabelEmbedder(nn.Module):
         return embeddings
 
 
+
 #################################################################################
 #                                 Core EqM Model                                #
 #################################################################################
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+class SwiGLU(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.SiLU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        
+        self.fc1_g = nn.Linear(in_features, hidden_features)
+        self.fc1_x = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x_g = self.fc1_g(x)
+        x_x = self.fc1_x(x)
+        x = self.act(x_g) * x_x
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+class DifferentialAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        # Differential Attention requires two sets of Q and K to compute the difference
+        # We project to 2 * dim for Q and K
+        self.q_proj = nn.Linear(dim, 2 * dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, 2 * dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        
+        # Learnable lambda parameter for the difference
+        # Initialized to a value that makes sense (e.g. corresponding to lambda ~ 0.8)
+        self.lambda_p = nn.Parameter(torch.zeros(num_heads, 1, 1) + 0.0) # exp(0) = 1.0, or we can tune init
+        
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        
+        # Project Q, K, V
+        # q: (B, N, 2*C) -> (B, N, 2, H, D) -> (2, B, H, N, D)
+        q = self.q_proj(x).reshape(B, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        k = self.k_proj(x).reshape(B, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        v = self.v_proj(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3) # (B, H, N, D)
+
+        q1, q2 = q[0], q[1] # (B, H, N, D)
+        k1, k2 = k[0], k[1] # (B, H, N, D)
+        
+        # Flash Attention for both maps
+        # Differential Attention: Attn = Softmax(Q1K1) - lambda * Softmax(Q2K2)
+        # Output = Attn @ V = Softmax(Q1K1)@V - lambda * Softmax(Q2K2)@V
+        # This allows us to use Flash Attention implementation for both terms!
+        
+        out1 = torch.nn.functional.scaled_dot_product_attention(
+            q1, k1, v,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+        )
+        out2 = torch.nn.functional.scaled_dot_product_attention(
+            q2, k2, v,
+            dropout_p=self.attn_drop.p if self.training else 0.0,
+        )
+        
+        # Calculate lambda = exp(lambda_p) - 1 + 1? Or just exp.
+        # Paper usually uses exp to ensure positivity.
+        # Let's use a simple learnable scalar.
+        lam = torch.exp(self.lambda_p) # (H, 1, 1)
+        
+        # Combine
+        out = out1 - lam * out2
+        
+        out = out.transpose(1, 2).reshape(B, N, C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
 
 class SiTBlock(nn.Module):
     """
@@ -101,12 +197,12 @@ class SiTBlock(nn.Module):
     """
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm1 = RMSNorm(hidden_size, eps=1e-6)
+        self.attn = DifferentialAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        # Approx GELU is not needed for SwiGLU, but keeping structure similar
+        self.mlp = SwiGLU(in_features=hidden_size, hidden_features=mlp_hidden_dim, drop=0)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -125,7 +221,7 @@ class FinalLayer(nn.Module):
     """
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_final = RMSNorm(hidden_size, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),

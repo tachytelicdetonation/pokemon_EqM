@@ -1,4 +1,5 @@
 import wandb
+import datetime
 import torch
 from torchvision.utils import make_grid
 import torch.distributed as dist
@@ -31,12 +32,16 @@ def initialize(args, entity, exp_name, project_name):
     if "WANDB_KEY" in os.environ:
         wandb.login(key=os.environ["WANDB_KEY"])
     
+    # Append timestamp to exp_name to ensure uniqueness
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{exp_name}_{timestamp}"
+
     wandb.init(
         entity=entity,
         project=project_name,
-        name=exp_name,
+        name=run_name,
         config=config_dict,
-        id=generate_run_id(exp_name),
+        id=generate_run_id(run_name),
         resume="allow",
     )
 
