@@ -83,23 +83,37 @@ def main(args):
         xt = z
         m = torch.zeros_like(xt).to(xt)
         
+        # Detach to prevent graph accumulation
+        xt = xt.detach()
+        if args.sampler == 'ngd':
+            m = m.detach()
+
         # Sampling loop (Gradient Descent)
-        for step in range(args.num_sampling_steps):
-            if args.sampler == 'gd':
-                out = model_fn(xt, t, y, args.cfg_scale) if args.cfg_scale > 1.0 else model_fn(xt, t, y)
-                if isinstance(out, tuple): out = out[0]
-            elif args.sampler == 'ngd':
-                x_ = xt + args.stepsize * m * args.mu
-                out = model_fn(x_, t, y, args.cfg_scale) if args.cfg_scale > 1.0 else model_fn(x_, t, y)
-                if isinstance(out, tuple): out = out[0]
-                m = out
-            
-            xt = xt + out * args.stepsize
-            # t += args.stepsize # Time conditioning might be fixed or evolving? In EqM paper, it's equilibrium, so t might not matter or be fixed.
-            # Ref code: t += args.stepsize. But wait, EqM is equilibrium, so maybe t is just a dummy or used for annealing?
-            # Ref code: t += args.stepsize
-            # Let's follow ref code.
-            t += args.stepsize
+        # Only use no_grad if we are not using an EBM (which requires gradients)
+        context = torch.no_grad() if args.ebm == 'none' else torch.enable_grad()
+        with context:
+            for step in range(args.num_sampling_steps):
+                if args.sampler == 'gd':
+                    out = model_fn(xt, t, y, args.cfg_scale) if args.cfg_scale > 1.0 else model_fn(xt, t, y)
+                    if isinstance(out, tuple): out = out[0]
+                elif args.sampler == 'ngd':
+                    x_ = xt + args.stepsize * m * args.mu
+                    out = model_fn(x_, t, y, args.cfg_scale) if args.cfg_scale > 1.0 else model_fn(x_, t, y)
+                    if isinstance(out, tuple): out = out[0]
+                    m = out
+                
+                xt = xt + out * args.stepsize
+                # t += args.stepsize # Time conditioning might be fixed or evolving? In EqM paper, it's equilibrium, so t might not matter or be fixed.
+                # Ref code: t += args.stepsize. But wait, EqM is equilibrium, so maybe t is just a dummy or used for annealing?
+                # Ref code: t += args.stepsize
+                # Let's follow ref code.
+                t += args.stepsize
+                
+                # Detach intermediate results to save memory if not needing gradients for next step (usually true for sampling)
+                # Even with EBM, we usually take a step and then detach for the next iteration unless we are doing BPTT through time (unlikely here)
+                xt = xt.detach()
+                if args.sampler == 'ngd':
+                    m = m.detach()
 
         if args.cfg_scale > 1.0:
             xt, _ = xt.chunk(2, dim=0)

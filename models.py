@@ -238,7 +238,8 @@ class EqM(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        x0.requires_grad_(True)
+        if self.ebm != 'none':
+            x0.requires_grad_(True)
         if self.uncond: # removes noise/time conditioning by setting to 0
             t = torch.zeros_like(t)
         act = []
