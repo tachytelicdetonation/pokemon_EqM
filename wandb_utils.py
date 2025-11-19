@@ -28,7 +28,9 @@ def generate_run_id(exp_name):
 
 def initialize(args, entity, exp_name, project_name):
     config_dict = namespace_to_dict(args)
-    wandb.login(key=os.environ["WANDB_KEY"])
+    if "WANDB_KEY" in os.environ:
+        wandb.login(key=os.environ["WANDB_KEY"])
+    
     wandb.init(
         entity=entity,
         project=project_name,
@@ -39,7 +41,7 @@ def initialize(args, entity, exp_name, project_name):
     )
 
 def log(stats, step=None):
-    if is_main_process():
+    if is_main_process() and wandb.run is not None:
         wandb.log({k: v for k, v in stats.items()}, step=step)
 
 
