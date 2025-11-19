@@ -194,7 +194,10 @@ def main(args):
     
     # Generate initial samples
     logger.info("Generating initial samples...")
-    sample_pokemon(ema, vae, args, device, num_samples=5, output_dir=os.path.join(sample_dir, f"step_{train_steps:07d}"))
+    # Temporarily override batch_size for sampling to avoid OOM
+    sample_args = deepcopy(args)
+    sample_args.batch_size = args.sample_batch_size
+    sample_pokemon(ema, vae, sample_args, device, num_samples=5, output_dir=os.path.join(sample_dir, f"step_{train_steps:07d}"))
 
     for epoch in range(start_epoch, args.epochs):
         logger.info(f"Beginning epoch {epoch}...")
@@ -247,7 +250,10 @@ def main(args):
                 
                 # Generate samples
                 logger.info(f"Generating samples at step {train_steps}...")
-                sample_pokemon(ema, vae, args, device, num_samples=5, output_dir=os.path.join(sample_dir, f"step_{train_steps:07d}"))
+                # Temporarily override batch_size for sampling to avoid OOM
+                sample_args = deepcopy(args)
+                sample_args.batch_size = args.sample_batch_size
+                sample_pokemon(ema, vae, sample_args, device, num_samples=5, output_dir=os.path.join(sample_dir, f"step_{train_steps:07d}"))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -280,6 +286,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--sampler", type=str, default='gd', choices=['gd', 'ngd', 'ode_dopri5', 'ode_euler', 'ode_heun'])
     parser.add_argument("--mu", type=float, default=0.3)
+    parser.add_argument("--sample-batch-size", type=int, default=1, help="Batch size for sample generation (smaller to avoid OOM)")
     parser.add_argument("--output-dir", type=str, default="generated_samples") # Used by sample_pokemon but overridden in loop
 
     args = parser.parse_args()
