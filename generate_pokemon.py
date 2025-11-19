@@ -73,7 +73,7 @@ def main(args):
         
         if args.cfg_scale > 1.0:
             z = torch.cat([z, z], 0)
-            y_null = torch.tensor([1000] * current_batch_size, device=device) # Assuming 1000 is null class
+            y_null = torch.tensor([args.num_classes] * current_batch_size, device=device) # Assuming args.num_classes is null class
             y = torch.cat([y, y_null], 0)
             t = torch.cat([t, t], 0)
             model_fn = model.forward_with_cfg
@@ -119,7 +119,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, required=True)
-    parser.add_argument("--model", type=str, choices=list(EqM_models.keys()), default="EqM-S/2")
+    parser.add_argument("--model", type=str, choices=list(EqM_models.keys()), default="EqM-XL/2")
     parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument("--num-classes", type=int, default=1)
     parser.add_argument("--num-samples", type=int, default=16)

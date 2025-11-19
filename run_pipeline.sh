@@ -27,3 +27,16 @@ fi
 # 5. Run training
 echo "Starting training..."
 python train_pokemon.py
+
+# 6. Generate samples
+echo "Generating samples..."
+# Find the latest checkpoint (assuming standard structure results/pokemon-eqm-*/checkpoints/*.pt)
+LATEST_CKPT=$(find results -name "*.pt" | sort -V | tail -n 1)
+
+if [ -z "$LATEST_CKPT" ]; then
+    echo "No checkpoint found!"
+else
+    echo "Using checkpoint: $LATEST_CKPT"
+    python generate_pokemon.py --ckpt "$LATEST_CKPT"
+fi
+
