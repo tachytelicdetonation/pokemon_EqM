@@ -14,6 +14,109 @@ from models import EqM_models
 from diffusers.models import AutoencoderKL
 from transport import create_transport, Sampler
 
+def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None):
+    if num_samples is None:
+        num_samples = args.num_samples
+    if output_dir is None:
+        output_dir = args.output_dir
+        
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Transport setup (if needed for ODE)
+    transport = create_transport(
+        args.path_type,
+        args.prediction,
+        args.loss_weight,
+        args.train_eps,
+        args.sample_eps
+    )
+    
+    n = num_samples
+    batch_size = args.batch_size
+    num_batches = (n + batch_size - 1) // batch_size
+    
+    print(f"Generating {n} samples in {num_batches} batches...")
+    
+    total_generated = 0
+    for i in range(num_batches):
+        current_batch_size = min(batch_size, n - total_generated)
+        
+        z = torch.randn(current_batch_size, 4, args.image_size // 8, args.image_size // 8, device=device)
+        y = torch.zeros(current_batch_size, dtype=torch.long, device=device)
+        t = torch.ones(current_batch_size, device=device)
+        
+        if args.cfg_scale > 1.0:
+            z = torch.cat([z, z], 0)
+            y_null = torch.tensor([args.num_classes] * current_batch_size, device=device)
+            y = torch.cat([y, y_null], 0)
+            t = torch.cat([t, t], 0)
+            model_fn = model.forward_with_cfg
+        else:
+            model_fn = model.forward
+
+        xt = z
+        m = torch.zeros_like(xt).to(xt)
+        
+        xt = xt.detach()
+        if args.sampler == 'ngd':
+            m = m.detach()
+
+        if args.sampler in ['gd', 'ngd']:
+            context = torch.no_grad() if args.ebm == 'none' else torch.enable_grad()
+            with context:
+                for step in range(args.num_sampling_steps):
+                    if args.sampler == 'gd':
+                        out = model_fn(xt, t, y, args.cfg_scale) if args.cfg_scale > 1.0 else model_fn(xt, t, y)
+                        if isinstance(out, tuple): out = out[0]
+                    elif args.sampler == 'ngd':
+                        x_ = xt + args.stepsize * m * args.mu
+                        out = model_fn(x_, t, y, args.cfg_scale) if args.cfg_scale > 1.0 else model_fn(x_, t, y)
+                        if isinstance(out, tuple): out = out[0]
+                        m = out
+                    
+                    xt = xt + out * args.stepsize
+                    t += args.stepsize
+                    
+                    xt = xt.detach()
+                    if args.sampler == 'ngd':
+                        m = m.detach()
+
+        elif args.sampler.startswith('ode'):
+            sampler = Sampler(transport)
+            
+            if args.sampler == 'ode_dopri5':
+                sample_fn = sampler.sample_ode(sampling_method='dopri5', num_steps=args.num_sampling_steps)
+            elif args.sampler == 'ode_euler':
+                sample_fn = sampler.sample_ode(sampling_method='euler', num_steps=args.num_sampling_steps)
+            elif args.sampler == 'ode_heun':
+                sample_fn = sampler.sample_ode(sampling_method='heun', num_steps=args.num_sampling_steps)
+            else:
+                raise ValueError(f"Unknown ODE sampler: {args.sampler}")
+            
+            model_kwargs = dict(y=y)
+            if args.cfg_scale > 1.0:
+                model_kwargs['cfg_scale'] = args.cfg_scale
+                model_fn = model.forward_with_cfg
+            else:
+                model_fn = model.forward
+            
+            traj = sample_fn(z, model_fn, **model_kwargs)
+            xt = traj[-1]
+
+        if args.cfg_scale > 1.0:
+            xt, _ = xt.chunk(2, dim=0)
+            
+        with torch.no_grad():
+            samples = vae.decode(xt / 0.18215).sample
+        
+        samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+        
+        for j, sample in enumerate(samples):
+            Image.fromarray(sample).save(f"{output_dir}/{total_generated + j:05d}.png")
+        
+        total_generated += current_batch_size
+        print(f"Generated {total_generated}/{n} samples.")
+
 def main(args):
     # Setup device
     if torch.backends.mps.is_available():
@@ -54,123 +157,7 @@ def main(args):
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
 
     # Sampling
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    n = args.num_samples
-    # Split into batches
-    batch_size = args.batch_size
-    num_batches = (n + batch_size - 1) // batch_size
-    
-    print(f"Generating {n} samples in {num_batches} batches...")
-    
-    total_generated = 0
-    for i in range(num_batches):
-        current_batch_size = min(batch_size, n - total_generated)
-        
-        z = torch.randn(current_batch_size, 4, latent_size, latent_size, device=device)
-        # Label 0 for pokemon
-        y = torch.zeros(current_batch_size, dtype=torch.long, device=device)
-        t = torch.ones(current_batch_size, device=device)
-        
-        if args.cfg_scale > 1.0:
-            z = torch.cat([z, z], 0)
-            y_null = torch.tensor([args.num_classes] * current_batch_size, device=device) # Assuming args.num_classes is null class
-            y = torch.cat([y, y_null], 0)
-            t = torch.cat([t, t], 0)
-            model_fn = model.forward_with_cfg
-        else:
-            model_fn = model.forward
-
-        xt = z
-        m = torch.zeros_like(xt).to(xt)
-        
-        # Detach to prevent graph accumulation
-        xt = xt.detach()
-        if args.sampler == 'ngd':
-            m = m.detach()
-
-        # Sampling loop
-        if args.sampler in ['gd', 'ngd']:
-            # Gradient Descent / Nesterov Accelerated Gradient
-            context = torch.no_grad() if args.ebm == 'none' else torch.enable_grad()
-            with context:
-                for step in range(args.num_sampling_steps):
-                    if args.sampler == 'gd':
-                        out = model_fn(xt, t, y, args.cfg_scale) if args.cfg_scale > 1.0 else model_fn(xt, t, y)
-                        if isinstance(out, tuple): out = out[0]
-                    elif args.sampler == 'ngd':
-                        x_ = xt + args.stepsize * m * args.mu
-                        out = model_fn(x_, t, y, args.cfg_scale) if args.cfg_scale > 1.0 else model_fn(x_, t, y)
-                        if isinstance(out, tuple): out = out[0]
-                        m = out
-                    
-                    xt = xt + out * args.stepsize
-                    # t += args.stepsize # Time conditioning might be fixed or evolving? In EqM paper, it's equilibrium, so t might not matter or be fixed.
-                    # Ref code: t += args.stepsize. But wait, EqM is equilibrium, so maybe t is just a dummy or used for annealing?
-                    # Ref code: t += args.stepsize
-                    # Let's follow ref code.
-                    t += args.stepsize
-                    
-                    # Detach intermediate results to save memory if not needing gradients for next step (usually true for sampling)
-                    # Even with EBM, we usually take a step and then detach for the next iteration unless we are doing BPTT through time (unlikely here)
-                    xt = xt.detach()
-                    if args.sampler == 'ngd':
-                        m = m.detach()
-
-        elif args.sampler.startswith('ode'):
-            transport = create_transport(
-                args.path_type,
-                args.prediction,
-                args.loss_weight,
-                args.train_eps,
-                args.sample_eps
-            )
-            sampler = Sampler(transport)
-            
-            if args.sampler == 'ode_dopri5':
-                sample_fn = sampler.sample_ode(sampling_method='dopri5', num_steps=args.num_sampling_steps)
-            elif args.sampler == 'ode_euler':
-                sample_fn = sampler.sample_ode(sampling_method='euler', num_steps=args.num_sampling_steps)
-            elif args.sampler == 'ode_heun':
-                sample_fn = sampler.sample_ode(sampling_method='heun', num_steps=args.num_sampling_steps)
-            else:
-                raise ValueError(f"Unknown ODE sampler: {args.sampler}")
-            
-            model_kwargs = dict(y=y)
-            if args.cfg_scale > 1.0:
-                model_kwargs['cfg_scale'] = args.cfg_scale
-                model_fn = model.forward_with_cfg
-            else:
-                model_fn = model.forward
-            
-            # ODE sampler expects model to be (x, t, **kwargs) -> output
-            # And it returns the trajectory or final sample?
-            # transport.sample_ode returns a function that returns samples
-            # The sample function returns 'samples' which is output of odeint
-            # odeint returns tensor of shape (n_steps, batch, ...)
-            
-            # We need to pass initial condition z
-            # z shape: (B, C, H, W)
-            
-            # sample_fn signature: sample(x, model, **model_kwargs)
-            
-            traj = sample_fn(z, model_fn, **model_kwargs)
-            xt = traj[-1] # Final state
-
-        if args.cfg_scale > 1.0:
-            xt, _ = xt.chunk(2, dim=0)
-            
-        # Decode
-        with torch.no_grad():
-            samples = vae.decode(xt / 0.18215).sample
-        
-        samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-        
-        for j, sample in enumerate(samples):
-            Image.fromarray(sample).save(f"{args.output_dir}/{total_generated + j:05d}.png")
-        
-        total_generated += current_batch_size
-        print(f"Generated {total_generated}/{n} samples.")
+    sample_pokemon(model, vae, args, device)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

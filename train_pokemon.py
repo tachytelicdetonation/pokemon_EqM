@@ -17,6 +17,8 @@ from diffusers.models import AutoencoderKL
 import wandb_utils
 
 from dataset import PokemonDataset
+from generate_pokemon import sample_pokemon
+import glob
 
 def update_ema(ema_model, model, decay=0.9999):
     ema_params = OrderedDict(ema_model.named_parameters())
@@ -47,16 +49,63 @@ def main(args):
 
     os.makedirs(args.results_dir, exist_ok=True)
     experiment_name = f"pokemon-eqm-{args.model}"
-    experiment_dir = os.path.join(args.results_dir, experiment_name)
+    
+    # Initialize WandB
+    run_id = None
+    run_name = None
+    try:
+        run_id, run_name = wandb_utils.initialize(args, entity=None, exp_name=experiment_name, project_name="pokemon-eqm")
+    except Exception as e:
+        logger.warning(f"WandB initialization failed: {e}")
+        # Fallback if wandb fails or is not used
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"{experiment_name}_{timestamp}"
+        run_id = run_name # Use name as ID if wandb fails
+
+    if args.run_id:
+        run_id = args.run_id
+        # If resuming, we might want to fetch the run name associated with this ID if possible, 
+        # or just assume the directory structure matches.
+        # For simplicity, let's assume if run_id is provided, we look for that specific directory.
+        # But wait, the directory structure is results/experiment_name/checkpoints
+        # It doesn't seem to use run_id in the path in the original code.
+        # We need to change the directory structure to include run_id or run_name.
+        pass
+
+    # Update experiment dir to include run_name/id to avoid collisions
+    # If args.run_id is provided, we try to find the existing directory.
+    
+    if args.run_id:
+        # Search for directory containing run_id
+        # Assuming structure: results/run_name (where run_name contains timestamp or is unique)
+        # Or results/experiment_name/run_id
+        # Let's stick to a cleaner structure: results/run_name
+        # But run_name is generated inside initialize.
+        
+        # If resuming, we expect the user to provide the run_id (which might be the wandb run id).
+        # But our directory might be named after run_name.
+        # Let's assume the user provides the full run_name or we search for it.
+        # Actually, let's change the structure to results/run_name
+        
+        # If args.run_id is passed, we assume it's the run_name (folder name) or we search for it.
+        potential_dirs = glob.glob(os.path.join(args.results_dir, f"*{args.run_id}*"))
+        if potential_dirs:
+            experiment_dir = potential_dirs[0]
+            logger.info(f"Resuming from directory: {experiment_dir}")
+        else:
+            logger.warning(f"Could not find directory for run_id {args.run_id}. Creating new one.")
+            experiment_dir = os.path.join(args.results_dir, run_name)
+    else:
+        experiment_dir = os.path.join(args.results_dir, run_name)
+
     os.makedirs(experiment_dir, exist_ok=True)
     checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
+    sample_dir = os.path.join(experiment_dir, "samples")
+    os.makedirs(sample_dir, exist_ok=True)
 
-    # Initialize WandB
-    try:
-        wandb_utils.initialize(args, entity=None, exp_name=experiment_name, project_name="pokemon-eqm")
-    except Exception as e:
-        logger.warning(f"WandB initialization failed: {e}")
+
 
     # Create model
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -74,6 +123,31 @@ def main(args):
     requires_grad(ema, False)
     
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+
+    start_epoch = 0
+    resume_step = 0
+    
+    # Resume logic
+    if args.run_id:
+        # Find latest checkpoint
+        ckpts = glob.glob(os.path.join(checkpoint_dir, "*.pt"))
+        if ckpts:
+            latest_ckpt = max(ckpts, key=os.path.getctime)
+            logger.info(f"Resuming from checkpoint: {latest_ckpt}")
+            checkpoint = torch.load(latest_ckpt, map_location=device)
+            model.load_state_dict(checkpoint["model"])
+            ema.load_state_dict(checkpoint["ema"])
+            opt.load_state_dict(checkpoint["opt"])
+            # args = checkpoint["args"] # Don't overwrite args, might want to change some
+            
+            # Extract step from filename if possible (0000100.pt)
+            try:
+                resume_step = int(os.path.basename(latest_ckpt).split('.')[0])
+                start_epoch = resume_step // (len(dataset) // args.batch_size) # Approx
+            except:
+                pass
+        else:
+            logger.warning("No checkpoints found in directory, starting from scratch.")
 
     # Transport
     transport = create_transport(
@@ -111,14 +185,18 @@ def main(args):
     model.train()
     ema.eval()
 
-    train_steps = 0
+    train_steps = resume_step
     log_steps = 0
     running_loss = 0
     start_time = time()
 
     logger.info(f"Training for {args.epochs} epochs...")
     
-    for epoch in range(args.epochs):
+    # Generate initial samples
+    logger.info("Generating initial samples...")
+    sample_pokemon(ema, vae, args, device, num_samples=5, output_dir=os.path.join(sample_dir, f"step_{train_steps:07d}"))
+
+    for epoch in range(start_epoch, args.epochs):
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
             x = x.to(device)
@@ -166,6 +244,10 @@ def main(args):
                 os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
                 torch.save(checkpoint, checkpoint_path)
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
+                
+                # Generate samples
+                logger.info(f"Generating samples at step {train_steps}...")
+                sample_pokemon(ema, vae, args, device, num_samples=5, output_dir=os.path.join(sample_dir, f"step_{train_steps:07d}"))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -190,6 +272,15 @@ if __name__ == "__main__":
     parser.add_argument("--loss-weight", type=str, default="velocity", choices=[None, "velocity", "likelihood"])
     parser.add_argument("--sample-eps", type=float)
     parser.add_argument("--train-eps", type=float)
+    parser.add_argument("--run_id", type=str, help="Run ID to resume from (or directory name)")
+    
+    # Sampling args for training loop
+    parser.add_argument("--num-samples", type=int, default=5)
+    parser.add_argument("--stepsize", type=float, default=0.0017)
+    parser.add_argument("--num-sampling-steps", type=int, default=250)
+    parser.add_argument("--sampler", type=str, default='gd', choices=['gd', 'ngd', 'ode_dopri5', 'ode_euler', 'ode_heun'])
+    parser.add_argument("--mu", type=float, default=0.3)
+    parser.add_argument("--output-dir", type=str, default="generated_samples") # Used by sample_pokemon but overridden in loop
 
     args = parser.parse_args()
     main(args)

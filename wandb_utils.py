@@ -44,6 +44,7 @@ def initialize(args, entity, exp_name, project_name):
         id=generate_run_id(run_name),
         resume="allow",
     )
+    return generate_run_id(run_name), run_name
 
 def log(stats, step=None):
     if is_main_process() and wandb.run is not None:
