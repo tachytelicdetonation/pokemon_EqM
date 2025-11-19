@@ -10,6 +10,8 @@ import math
 
 
 def is_main_process():
+    if not dist.is_available() or not dist.is_initialized():
+        return True
     return dist.get_rank() == 0
 
 def namespace_to_dict(namespace):
