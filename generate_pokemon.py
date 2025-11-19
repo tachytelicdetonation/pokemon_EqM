@@ -13,6 +13,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../ref'
 from models import EqM_models
 from diffusers.models import AutoencoderKL
 from transport import create_transport, Sampler
+from vae_utils import load_vae, decode_latents
 
 def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None):
     if num_samples is None:
@@ -41,7 +42,9 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None):
     for i in range(num_batches):
         current_batch_size = min(batch_size, n - total_generated)
         
-        z = torch.randn(current_batch_size, 4, args.image_size // 8, args.image_size // 8, device=device)
+        # Determine latent channels from model or args
+        in_channels = model.in_channels if hasattr(model, 'in_channels') else 4
+        z = torch.randn(current_batch_size, in_channels, args.image_size // 8, args.image_size // 8, device=device)
         y = torch.zeros(current_batch_size, dtype=torch.long, device=device)
         t = torch.ones(current_batch_size, device=device)
         
@@ -107,7 +110,7 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None):
             xt, _ = xt.chunk(2, dim=0)
             
         with torch.no_grad():
-            samples = vae.decode(xt / 0.18215).sample
+            samples = decode_latents(vae, xt, device)
         
         samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
         
@@ -136,6 +139,7 @@ def main(args):
     model = EqM_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
+        in_channels=args.vae_channels,
         uncond=args.uncond,
         ebm=args.ebm
     ).to(device)
@@ -154,7 +158,7 @@ def main(args):
     model.eval()
     
     # VAE
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    vae = load_vae(args.vae_path, args.vae, device)
 
     # Sampling
     sample_pokemon(model, vae, args, device)
@@ -168,6 +172,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-samples", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
+    parser.add_argument("--vae-path", type=str, default="qwen_image_vae.safetensors", help="Path to local VAE checkpoint (e.g. .safetensors)")
+    parser.add_argument("--vae-channels", type=int, default=16, help="Number of VAE channels (4 for SD, 16 for Wan/Qwen)")
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--stepsize", type=float, default=0.0017)
     parser.add_argument("--num-sampling-steps", type=int, default=250)

@@ -13,8 +13,9 @@ from copy import deepcopy
 
 from models import EqM_models
 from transport import create_transport, Sampler
-from diffusers.models import AutoencoderKL
+from diffusers import AutoencoderKL
 import wandb_utils
+from vae_utils import load_vae, encode_latents
 
 from dataset import PokemonDataset
 from generate_pokemon import sample_pokemon
@@ -115,6 +116,7 @@ def main(args):
     model = EqM_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
+        in_channels=args.vae_channels,
         uncond=args.uncond,
         ebm=args.ebm
     ).to(device)
@@ -159,7 +161,7 @@ def main(args):
     )
 
     # VAE
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    vae = load_vae(args.vae_path, args.vae, device)
     requires_grad(vae, False)
 
     # Data
@@ -208,8 +210,7 @@ def main(args):
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 # VAE encode expects (B, C, H, W)
-                posterior = vae.encode(x).latent_dist
-                x = posterior.sample().mul_(0.18215)
+                x = encode_latents(vae, x, device)
             
             model_kwargs = dict(y=y, return_act=False, train=True)
             loss_dict = transport.training_losses(model, x, model_kwargs)
@@ -265,6 +266,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
+    parser.add_argument("--vae-path", type=str, default="qwen_image_vae.safetensors", help="Path to local VAE checkpoint (e.g. .safetensors)")
+    parser.add_argument("--vae-channels", type=int, default=16, help="Number of VAE channels (4 for SD, 16 for Wan/Qwen)")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--ckpt-every", type=int, default=1000)
