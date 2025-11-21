@@ -6,3 +6,4 @@ wandb/
 results/
 *.safetensors
 data/
+test_run_config/

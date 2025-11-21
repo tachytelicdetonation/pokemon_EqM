@@ -139,23 +139,31 @@ class Transport:
         """
         if model_kwargs == None: 
             model_kwargs = {}
-        
+        apply_disp_loss = model_kwargs.pop("apply_disp_loss", None)
+        return_act = model_kwargs.get("return_act", False)
+        if apply_disp_loss is None:
+            apply_disp_loss = return_act
+
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         ut = ut * self.get_ct(t)[:,None,None,None] # use energy-compatible target
         model_output = model(xt, t, **model_kwargs)
         disp_loss = 0
+        penultimate = None
 
         # get intermediate activation and apply Dispersive Loss
-        if "return_act" in model_kwargs and model_kwargs['return_act']:
+        if return_act:
             model_output, act = model_output
-            disp_loss = self.disp_loss(act[len(act)-1])
+            penultimate = act[-1]
+            if apply_disp_loss:
+                disp_loss = self.disp_loss(penultimate)
         
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
 
         terms = {}
         terms['pred'] = model_output
+        terms['penultimate'] = penultimate
         if self.model_type == ModelType.VELOCITY:
             terms['loss'] = mean_flat(((model_output - ut) ** 2))
         else: 

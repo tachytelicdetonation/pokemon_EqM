@@ -26,7 +26,7 @@ fi
 
 # 5. Run training
 echo "Starting training..."
-python train_pokemon.py
+python train_pokemon.py --config production
 
 # 6. Generate samples
 echo "Generating samples..."
@@ -37,6 +37,6 @@ if [ -z "$LATEST_CKPT" ]; then
     echo "No checkpoint found!"
 else
     echo "Using checkpoint: $LATEST_CKPT"
-    python generate_pokemon.py --ckpt "$LATEST_CKPT"
+    python generate_pokemon.py --ckpt "$LATEST_CKPT" --config production
 fi
 

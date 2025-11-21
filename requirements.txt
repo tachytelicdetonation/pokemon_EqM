@@ -5,3 +5,5 @@ diffusers
 accelerate
 torchdiffeq
 wandb
+schedulefree
+torchmetrics

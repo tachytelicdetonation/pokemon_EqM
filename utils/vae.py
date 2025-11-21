@@ -9,6 +9,9 @@ def load_vae(vae_path=None, vae_type="ema", device="cpu"):
     Load VAE model from local path or HuggingFace hub.
     """
     if vae_path:
+        import os
+        if not os.path.isabs(vae_path):
+            vae_path = os.path.abspath(vae_path)
         logger.info(f"Loading VAE from {vae_path}")
         try:
             vae = AutoencoderKLWan.from_single_file(vae_path).to(device)
