@@ -6,4 +6,4 @@ accelerate
 torchdiffeq
 wandb
 schedulefree
-torchmetrics
+torchmetrics[image]
