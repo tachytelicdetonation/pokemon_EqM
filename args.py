@@ -50,7 +50,9 @@ def get_args():
         "seed": 42,
         "log_images": True,
         "watch_grads": False,
-        "adaptive": True,
+        # Adaptive early-stop for sampling is off by default to avoid zero-step samples on fresh models.
+        "adaptive": False,
+        "min_adaptive_steps": 10,
         "grad_thresh": 10.0,
         "sigreg_lambda": 0.1,
         "noised_input_path": None,

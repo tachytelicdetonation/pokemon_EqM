@@ -89,6 +89,7 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
     stepsize = base_dt * getattr(args, "stepsize_mult", 1.0)
     energy_head = getattr(args, "energy_head", getattr(args, "ebm", "implicit"))
     adaptive = bool(getattr(args, "adaptive", False))
+    min_adaptive_steps = int(getattr(args, "min_adaptive_steps", 0) or 0)
     grad_thresh = float(getattr(args, "grad_thresh", 10.0))
     collect_energy = energy_head != "implicit"
 
@@ -171,8 +172,9 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
 
                     if adaptive:
                         step_counts[active] += 1
-                        newly_finished = grad_norm < grad_thresh
-                        finished = finished | newly_finished
+                        if step + 1 >= min_adaptive_steps:
+                            newly_finished = grad_norm < grad_thresh
+                            finished = finished | newly_finished
                     else:
                         step_counts += 1
 

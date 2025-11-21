@@ -52,14 +52,20 @@ fi
 echo "Starting training..."
 python train_pokemon.py --config production
 
-# 6. Generate samples
+# 6. Generate samples from the newest run's latest checkpoint
 echo "Generating samples..."
-# Find the latest checkpoint (assuming standard structure results/pokemon-eqm-*/checkpoints/*.pt)
-LATEST_CKPT=$(find results -name "*.pt" | sort -V | tail -n 1)
+LATEST_RUN=$(ls -td results/pokemon-eqm-* 2>/dev/null | head -n 1 || true)
+if [ -z "$LATEST_RUN" ]; then
+    echo "No run directory found under results/. Skipping sample generation."
+    exit 0
+fi
+
+LATEST_CKPT=$(find "$LATEST_RUN"/checkpoints -maxdepth 1 -name "*.pt" -print | sort -V | tail -n 1)
 
 if [ -z "$LATEST_CKPT" ]; then
-    echo "No checkpoint found!"
-else
-    echo "Using checkpoint: $LATEST_CKPT"
-    python generate_pokemon.py --ckpt "$LATEST_CKPT" --config production
+    echo "No checkpoint found in $LATEST_RUN/checkpoints. Skipping sample generation."
+    exit 0
 fi
+
+echo "Using checkpoint: $LATEST_CKPT"
+python generate_pokemon.py --ckpt "$LATEST_CKPT" --config production --output_dir "$LATEST_RUN/generated_samples"
