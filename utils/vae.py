@@ -1,3 +1,4 @@
+import os
 import torch
 import logging
 from diffusers import AutoencoderKL, AutoencoderKLWan
@@ -9,21 +10,28 @@ def load_vae(vae_path=None, vae_type="ema", device="cpu"):
     Load VAE model from local path or HuggingFace hub.
     """
     if vae_path:
-        import os
         if not os.path.isabs(vae_path):
             vae_path = os.path.abspath(vae_path)
+
         logger.info(f"Loading VAE from {vae_path}")
-        try:
-            vae = AutoencoderKLWan.from_single_file(vae_path).to(device)
-            logger.info("Loaded Wan/Qwen VAE")
-            return vae
-        except Exception:
-            logger.info("Failed to load as Wan VAE, trying standard AutoencoderKL")
-            vae = AutoencoderKL.from_single_file(vae_path).to(device)
-            return vae
-    else:
-        vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{vae_type}").to(device)
-        return vae
+
+        if os.path.isfile(vae_path):
+            try:
+                vae = AutoencoderKLWan.from_single_file(vae_path).to(device)
+                logger.info("Loaded Wan/Qwen VAE")
+                return vae
+            except Exception:
+                logger.info("Failed to load as Wan VAE, trying standard AutoencoderKL")
+                try:
+                    vae = AutoencoderKL.from_single_file(vae_path).to(device)
+                    return vae
+                except Exception as e:
+                    logger.warning(f"Could not load VAE from {vae_path}: {e}. Falling back to Stable Diffusion VAE.")
+        else:
+            logger.warning(f"VAE file not found at {vae_path}. Falling back to Stable Diffusion VAE sd-vae-ft-{vae_type}.")
+
+    logger.info(f"Loading Stable Diffusion VAE sd-vae-ft-{vae_type}")
+    return AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{vae_type}").to(device)
 
 def encode_latents(vae, x, device):
     """
