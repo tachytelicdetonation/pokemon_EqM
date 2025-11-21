@@ -21,7 +21,7 @@ uv pip install -r requirements.txt
 # 4. Download data
 if [ ! -d "data/raw" ]; then
     echo "Downloading data..."
-    python download_data.py
+    python scripts/download_data.py
 fi
 
 # 5. Run training
