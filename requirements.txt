@@ -7,4 +7,3 @@ torchdiffeq
 wandb
 schedulefree
 torchmetrics
-zipp==3.23.0
