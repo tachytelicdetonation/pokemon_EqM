@@ -82,7 +82,11 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
     num_batches = (n + batch_size - 1) // batch_size
 
     cfg_scale = min(args.cfg_scale, getattr(args, "cfg_scale_cap", args.cfg_scale))
-    stepsize = args.stepsize * getattr(args, "stepsize_mult", 1.0)
+    sample_eps = float(getattr(args, "sample_eps", 0.0) or 0.0)
+    # If the user didn't tune stepsize explicitly, traverse [sample_eps, 1] evenly.
+    user_stepsize = getattr(args, "stepsize", None)
+    base_dt = (1.0 - sample_eps) / max(1, args.num_sampling_steps) if user_stepsize is None else user_stepsize
+    stepsize = base_dt * getattr(args, "stepsize_mult", 1.0)
     energy_head = getattr(args, "energy_head", getattr(args, "ebm", "implicit"))
     adaptive = bool(getattr(args, "adaptive", False))
     grad_thresh = float(getattr(args, "grad_thresh", 10.0))
@@ -116,7 +120,8 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
             z = torch.randn(current_batch_size, in_channels, args.image_size // 8, args.image_size // 8, device=device)
 
         y = torch.zeros(current_batch_size, dtype=torch.long, device=device)
-        t = torch.ones(current_batch_size, device=device)
+        # Start integration at sample_eps (0 by default) and march forward to t=1.
+        t = torch.full((current_batch_size,), sample_eps, device=device)
 
         cfg_on = cfg_scale > 1.0
         if cfg_on:
@@ -171,13 +176,21 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
                     else:
                         step_counts += 1
 
+                    # Clamp dt to avoid overshooting t>1
+                    dt = torch.full_like(t, stepsize)
+                    remaining = (1.0 - t).clamp(min=0.0)
+                    dt = torch.minimum(dt, remaining)
+
                     out = out * active.view(-1, 1, 1, 1)
-                    xt = xt + out * stepsize
-                    t = t + active.float() * stepsize
+                    xt = xt + out * dt.view(-1, 1, 1, 1)
+                    t = t + active.float() * dt
 
                     xt = xt.detach()
                     if args.sampler == 'ngd':
                         m = out.detach()
+
+                    # Mark samples that have reached t >= 1
+                    finished = finished | (t >= 1.0 - 1e-6)
 
                 per_sample_counts = step_counts[:current_batch_size] if cfg_on else step_counts
                 all_step_counts.append(per_sample_counts.cpu())
