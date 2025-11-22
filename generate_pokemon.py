@@ -143,7 +143,9 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
             last_energy = None
 
             # Main steps
-            for _ in range(max(1, args.num_sampling_steps - 1)):
+            total_steps = max(1, args.num_sampling_steps - 1)
+            log_interval = max(1, total_steps // 10)  # Log 10 times during sampling
+            for step_idx in range(total_steps):
                 if args.sampler == 'gd':
                     out_obj = model_forward(xt, t)
                 else:  # ngd (look-ahead)
@@ -162,6 +164,10 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
 
                 if args.sampler == 'ngd':
                     m = out.detach()
+
+                # Progress logging
+                if (step_idx + 1) % log_interval == 0 or step_idx == 0:
+                    print(f"  Sampling step {step_idx + 1}/{total_steps} (t={t[0].item():.4f})...")
 
             # Final corrective step to land exactly at t=1 (prevents under-integration when stepsize is small).
             remaining = (1.0 - t).clamp(min=0.0)
