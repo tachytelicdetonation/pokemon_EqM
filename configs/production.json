@@ -11,7 +11,12 @@
   "grad_clip": 1.0,
   "cache_latents": true,
   "stepsize": 0.0017,
-  "cfg_scale": 4.0,
+  "cfg_scale": 1.5,
+  "cfg_scale_cap": 1.5,
   "use_liere": true,
-  "use_rope": false
+  "use_rope": false,
+  "use_mg": true,
+  "mg_lambda": 0.1,
+  "mg_energy_head": "dot",
+  "energy_head": "dot"
 }

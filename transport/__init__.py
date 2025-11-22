@@ -6,6 +6,9 @@ def create_transport(
     loss_weight=None,
     train_eps=None,
     sample_eps=None,
+    use_mg=False,
+    mg_lambda=0.1,
+    mg_energy_head='dot',
 ):
     """function for creating Transport object
     **Note**: model prediction defaults to velocity
@@ -17,6 +20,9 @@ def create_transport(
     - likelihood_weighted: weight loss by likelihood weight
     - train_eps: small epsilon for avoiding instability during training
     - sample_eps: small epsilon for avoiding instability during sampling
+    - use_mg: enable Model-Guidance training
+    - mg_lambda: guidance strength for Model-Guidance
+    - mg_energy_head: energy head type for Model-Guidance (dot, l2, implicit)
     """
 
     if prediction == "noise":
@@ -58,6 +64,9 @@ def create_transport(
         loss_type=loss_type,
         train_eps=train_eps,
         sample_eps=sample_eps,
+        use_mg=use_mg,
+        mg_lambda=mg_lambda,
+        mg_energy_head=mg_energy_head,
     )
-    
+
     return state

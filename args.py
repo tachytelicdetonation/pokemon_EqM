@@ -87,6 +87,12 @@ def get_args():
         "use_liere": True,  # Enable LieRE (learnable rotation matrices via Lie algebra) - Optimized with Cayley transform
                            # LieRE is now the default - it learns optimal positional encodings
                            # Reference: https://arxiv.org/abs/2406.10322 (ICML 2025)
+        # Model-Guidance (MG) settings - arXiv:2502.12154
+        "use_mg": False,  # Enable Model-Guidance training (energy-guided targets)
+        "mg_lambda": 0.1,  # Guidance strength (0.0 = no guidance, higher = stronger)
+        "mg_schedule": "constant",  # Guidance schedule: constant, linear, cosine
+        "mg_start_epoch": 0,  # Epoch to start MG training (0 = from beginning)
+        "mg_energy_head": "dot",  # Energy formulation for guidance: dot, l2, or implicit
     }
 
     # Load config from JSON

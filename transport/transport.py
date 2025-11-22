@@ -47,6 +47,9 @@ class Transport:
         loss_type,
         train_eps,
         sample_eps,
+        use_mg=False,
+        mg_lambda=0.1,
+        mg_energy_head='dot',
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -59,6 +62,10 @@ class Transport:
         self.path_sampler = path_options[path_type]()
         self.train_eps = train_eps
         self.sample_eps = sample_eps
+        # Model-Guidance parameters
+        self.use_mg = use_mg
+        self.mg_lambda = mg_lambda
+        self.mg_energy_head = mg_energy_head
 
     def prior_logp(self, z):
         '''
@@ -125,6 +132,55 @@ class Transport:
         ct = th.minimum(start-(start-1)/(interp)*t, 1/(1-interp)-1/(1-interp)*t)*4
         return ct
 
+    def compute_energy_guidance(self, model, xt, t, x0, model_kwargs):
+        """Compute energy-based guidance signal for Model-Guidance training
+
+        Args:
+            model: The neural network model
+            xt: Noisy latent at time t
+            t: Time step
+            x0: Original noise sample
+            model_kwargs: Additional model arguments (labels, etc.)
+
+        Returns:
+            Energy gradient for guidance
+        """
+        # Enable gradients for xt
+        xt_guided = xt.detach().requires_grad_(True)
+
+        # Forward pass through model
+        with th.enable_grad():
+            pred = model(xt_guided, t, get_energy=True, train=True, **model_kwargs)
+
+            # Handle different output formats
+            if isinstance(pred, tuple):
+                pred, energy = pred
+            else:
+                pred, energy = pred, None
+
+            # Compute energy based on energy_head type
+            if self.mg_energy_head == 'l2':
+                if energy is None:
+                    energy = -0.5 * th.sum(pred ** 2, dim=(1, 2, 3))
+            elif self.mg_energy_head == 'dot':
+                if energy is None:
+                    energy = th.sum(pred * xt_guided, dim=(1, 2, 3))
+            elif self.mg_energy_head == 'implicit':
+                # For implicit energy, return the prediction directly as guidance
+                return pred.detach()
+
+            # Compute gradient of energy w.r.t. xt
+            if energy is not None:
+                energy_grad = th.autograd.grad(
+                    outputs=energy.sum(),
+                    inputs=xt_guided,
+                    create_graph=False,  # Don't need second-order gradients
+                )[0]
+                return energy_grad.detach()
+            else:
+                # Fallback: use model prediction as guidance
+                return pred.detach()
+
     def training_losses(
         self, 
         model,  
@@ -147,6 +203,16 @@ class Transport:
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         ut = ut * self.get_ct(t)[:,None,None,None] # use energy-compatible target
+
+        # Model-Guidance: Compute energy-guided targets if enabled
+        if self.use_mg and self.mg_lambda > 0:
+            # Compute energy guidance signal
+            energy_guidance = self.compute_energy_guidance(model, xt, t, x0, model_kwargs)
+            # Blend velocity target with energy guidance
+            guided_ut = ut + self.mg_lambda * energy_guidance
+        else:
+            guided_ut = ut
+
         model_output = model(xt, t, **model_kwargs)
         disp_loss = 0
         penultimate = None
@@ -157,7 +223,7 @@ class Transport:
             penultimate = act[-1]
             if apply_disp_loss:
                 disp_loss = self.disp_loss(penultimate)
-        
+
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
 
@@ -165,7 +231,7 @@ class Transport:
         terms['pred'] = model_output
         terms['penultimate'] = penultimate
         if self.model_type == ModelType.VELOCITY:
-            terms['loss'] = mean_flat(((model_output - ut) ** 2))
+            terms['loss'] = mean_flat(((model_output - guided_ut) ** 2))
         else: 
             _, drift_var = self.path_sampler.compute_drift(xt, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, xt))

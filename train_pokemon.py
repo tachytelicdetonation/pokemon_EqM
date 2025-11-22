@@ -123,7 +123,10 @@ def main():
         args.prediction,
         args.loss_weight,
         args.train_eps,
-        args.sample_eps
+        args.sample_eps,
+        use_mg=getattr(args, 'use_mg', False),
+        mg_lambda=getattr(args, 'mg_lambda', 0.1),
+        mg_energy_head=getattr(args, 'mg_energy_head', 'dot'),
     )
 
     # VAE
