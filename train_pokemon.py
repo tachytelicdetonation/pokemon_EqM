@@ -18,6 +18,14 @@ try:
 except ImportError:
     GradScaler = None
 
+# Float8 training support
+try:
+    from torchao.float8 import convert_to_float8_training
+    TORCHAO_AVAILABLE = True
+except ImportError:
+    TORCHAO_AVAILABLE = False
+    convert_to_float8_training = None
+
 def requires_grad(model, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
@@ -47,7 +55,7 @@ def main():
     # Create model
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
-    
+
     model = EqM_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
@@ -55,6 +63,18 @@ def main():
         uncond=args.uncond,
         energy_head=args.energy_head
     ).to(device)
+
+    # Apply FP8 conversion before compilation (if enabled)
+    use_torchao_fp8 = False
+    if getattr(args, 'mixed_precision', None) == 'fp8':
+        if TORCHAO_AVAILABLE:
+            logger.info("Converting model to float8 training with torchao...")
+            convert_to_float8_training(model)
+            use_torchao_fp8 = True
+            logger.info("Float8 conversion complete")
+        else:
+            logger.warning("torchao not available, falling back to bfloat16")
+            args.mixed_precision = 'bf16'
 
     # Compile model for faster execution (PyTorch 2.0+)
     if getattr(args, 'compile', False):
@@ -112,20 +132,24 @@ def main():
     use_amp = getattr(args, 'mixed_precision', None)
 
     if use_amp and device.type == 'cuda':
-        # Map precision string to dtype
-        dtype_map = {
-            'fp16': torch.float16,
-            'bf16': torch.bfloat16,
-            'fp8': torch.float8_e4m3fn if hasattr(torch, 'float8_e4m3fn') else torch.bfloat16,
-        }
-        amp_dtype = dtype_map.get(use_amp, torch.bfloat16)
-
-        # GradScaler only needed for fp16, not bf16 or fp8
-        if use_amp == 'fp16' and GradScaler is not None:
-            scaler = GradScaler()
-            logger.info("Using mixed precision training: fp16 with GradScaler")
+        # For FP8 with torchao, we don't use autocast (torchao handles it internally)
+        if use_torchao_fp8:
+            amp_dtype = None  # No autocast for torchao FP8
+            logger.info("Using float8 training with torchao (no autocast)")
         else:
-            logger.info(f"Using mixed precision training: {use_amp} (dtype={amp_dtype})")
+            # Map precision string to dtype for autocast
+            dtype_map = {
+                'fp16': torch.float16,
+                'bf16': torch.bfloat16,
+            }
+            amp_dtype = dtype_map.get(use_amp, torch.bfloat16)
+
+            # GradScaler only needed for fp16
+            if use_amp == 'fp16' and GradScaler is not None:
+                scaler = GradScaler()
+                logger.info("Using mixed precision training: fp16 with GradScaler")
+            else:
+                logger.info(f"Using mixed precision training: {use_amp} (dtype={amp_dtype})")
 
     model.train()
     opt.train()

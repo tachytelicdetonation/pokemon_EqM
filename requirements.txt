@@ -8,3 +8,4 @@ wandb
 schedulefree
 torchmetrics[image]
 lpips
+torchao
