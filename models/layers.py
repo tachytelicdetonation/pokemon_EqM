@@ -191,7 +191,8 @@ class DifferentialAttention(nn.Module):
     def _apply_rope(self, q):
         # q: (B, heads, N, head_dim)
         cos, sin = self._get_rope(q.size(2), q.device, q.dtype)
-        return (q * cos) + (self._rotate_half(q) * sin)
+        # Clone to prevent CUDA graph issues with cached tensors
+        return (q * cos.clone()) + (self._rotate_half(q) * sin.clone())
 
     def _get_window_mask(self, seq_len, device, dtype):
         if self.window_size is None:
