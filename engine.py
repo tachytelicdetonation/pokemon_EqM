@@ -94,7 +94,15 @@ class Trainer:
             try:
                 batch, _ = next(iter(loader))
                 take = min(getattr(self.args, "metrics_subset_size", 16), batch.size(0))
-                self.val_reference = batch[:take].to(device)
+                ref = batch[:take].to(device)
+                
+                # If ref is latents (channels > 3), decode to images
+                if ref.shape[1] > 3:
+                    from utils.vae import decode_latents
+                    with torch.no_grad():
+                        ref = decode_latents(self.vae, ref, device)
+                
+                self.val_reference = ref
             except Exception as e:
                 logger.warning(f"Unable to grab validation batch for metrics: {e}")
 
