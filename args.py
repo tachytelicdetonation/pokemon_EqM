@@ -79,9 +79,9 @@ def get_args():
         "compile_mode": "max-autotune",  # Options: "default", "reduce-overhead", "max-autotune"
         "cache_latents": True,  # Cache VAE-encoded latents (requires preprocessing)
         # Positional Encodings: RoPE or LieRE (cannot use both simultaneously)
-        "use_rope": True,  # Enable 2D Axial RoPE (fixed rotations for H and W dimensions)
+        "use_rope": False,  # Enable 2D Axial RoPE (fixed rotations for H and W dimensions)
         "rope_base": 10000,  # Base frequency for RoPE (higher = better long-range modeling)
-        "use_liere": False,  # Enable LieRE (learnable rotation matrices via Lie algebra) - DISABLED: has severe performance bug (44s/step)
+        "use_liere": True,  # Enable LieRE (learnable rotation matrices via Lie algebra) - Optimized with Cayley transform
                            # LieRE is now the default - it learns optimal positional encodings
                            # Reference: https://arxiv.org/abs/2406.10322 (ICML 2025)
     }
@@ -133,6 +133,14 @@ def get_args():
     # Normalize legacy sentinel
     if str(config.get('energy_head', 'implicit')).lower() == 'none':
         config['energy_head'] = 'implicit'
+
+    # Enforce mutual exclusivity for positional encodings
+    # If LieRE is enabled, force RoPE off
+    if config.get('use_liere', False):
+        config['use_rope'] = False
+    # If RoPE is enabled (and LieRE wasn't prioritized), force LieRE off
+    elif config.get('use_rope', False):
+        config['use_liere'] = False
 
     # Add config name for logging
     config['config'] = args.config

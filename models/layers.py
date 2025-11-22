@@ -144,10 +144,13 @@ class LieRE(nn.Module):
 
     def _get_rotations(self, dimensions, device, dtype):
         """
-        Generate rotation matrices for given spatial dimensions.
-
-        Note: Caching is disabled for LieRE since the generator_params are learnable
-        and change during training. Gradients must flow through this computation.
+        Generate rotation matrices for given spatial dimensions using Cayley transform.
+        
+        The Cayley transform maps a skew-symmetric matrix A to a rotation matrix R:
+        R = (I - A)^{-1} (I + A)
+        
+        This is computationally cheaper than matrix exponential and compatible with 
+        CUDA graphs / torch.compile.
 
         Args:
             dimensions: Tuple of spatial dimensions (H, W) for 2D
@@ -176,11 +179,22 @@ class LieRE(nn.Module):
         in_basis_positions = positions.reshape(list(positions.shape) + [1, 1]) * skew_matrices
 
         # Sum over dimensions to get generator for each position: [H*W, dim, dim]
-        generator_pos = torch.sum(in_basis_positions, dim=1)
+        A = torch.sum(in_basis_positions, dim=1)
 
-        # Compute matrix exponential in ONE vectorized operation (100x faster than loops!)
-        # This replaces the Python loop over 1024 positions
-        rotation_matrices = torch.matrix_exp(generator_pos.to(dtype=torch.float32)).to(dtype=dtype)
+        # Apply Cayley transform: R = (I - A)^-1 (I + A)
+        # This is much faster than matrix_exp and supports CUDA graphs
+        I = torch.eye(self.dim, device=device, dtype=dtype).unsqueeze(0) # Broadcastable Identity
+        
+        # Ensure A is in the correct dtype
+        A = A.to(dtype=dtype)
+        
+        # Solve (I - A) * R = (I + A)
+        # Using explicit inverse for better compatibility across backends (MPS/CUDA)
+        # R = (I - A)^-1 @ (I + A)
+        numerator = I + A
+        denominator = I - A
+        
+        rotation_matrices = torch.linalg.inv(denominator) @ numerator
 
         return rotation_matrices  # [num_positions, dim, dim]
 
