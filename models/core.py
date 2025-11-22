@@ -26,8 +26,6 @@ class EqM(nn.Module):
         energy_head='implicit',
         kv_heads=None,
         use_qk_norm=True,
-        use_rope=True,
-        rope_base=10000,
         head_drop=0.0,
         window_size=None,
         use_abs_pos_emb=False,
@@ -54,8 +52,6 @@ class EqM(nn.Module):
         block_kwargs = dict(
             kv_heads=kv_heads,
             use_qk_norm=use_qk_norm,
-            use_rope=use_rope,
-            rope_base=rope_base,
             head_drop=head_drop,
             window_size=window_size,
         )

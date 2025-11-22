@@ -111,13 +111,11 @@ class DifferentialAttention(nn.Module):
         attn_drop=0.,
         proj_drop=0.,
         use_qk_norm=True,
-        use_rope=True,
-        rope_base=10000,
         head_drop=0.0,
         window_size=None,
     ):
         """
-        Differential (two-branch) attention with optional RoPE, QK normalization, 
+        Differential (two-branch) attention with QK normalization,
         grouped/shared KV heads, head drop regularization, and safer lambda init.
         """
         super().__init__()
@@ -127,9 +125,6 @@ class DifferentialAttention(nn.Module):
         assert dim % self.kv_heads == 0, 'dim should be divisible by kv_heads'
         assert self.num_heads % self.kv_heads == 0, 'num_heads must be divisible by kv_heads'
         self.head_dim = dim // num_heads
-        assert self.head_dim % 2 == 0, 'head_dim must be even for RoPE'
-        self.rope_base = rope_base
-        self.use_rope = use_rope
         self.use_qk_norm = use_qk_norm
         self.head_drop = head_drop
         self.window_size = window_size
@@ -147,52 +142,7 @@ class DifferentialAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        self._rope_cache = {}
         self._mask_cache = {}
-
-    @staticmethod
-    def _rotate_half(x):
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        return torch.stack((-x2, x1), dim=-1).reshape_as(x)
-
-    def _get_rope(self, seq_len, device, dtype):
-        key = (seq_len, device, dtype)
-        if key in self._rope_cache:
-            return self._rope_cache[key]
-
-        head_dim = self.head_dim
-        # assume square grid; fall back to 1D if not square
-        side = int(seq_len ** 0.5)
-        if side * side != seq_len:
-            side = seq_len
-            pos_h = torch.arange(seq_len, device=device, dtype=torch.float32)
-            pos_w = torch.zeros_like(pos_h)
-        else:
-            h = torch.arange(side, device=device, dtype=torch.float32)
-            w = torch.arange(side, device=device, dtype=torch.float32)
-            grid_h, grid_w = torch.meshgrid(h, w, indexing='ij')
-            pos_h = grid_h.reshape(-1)
-            pos_w = grid_w.reshape(-1)
-
-        dim_half = head_dim // 2
-        freq_seq = torch.arange(dim_half, device=device, dtype=torch.float32)
-        inv_freq = torch.pow(torch.tensor(self.rope_base, device=device, dtype=torch.float32), -freq_seq / dim_half)
-
-        theta_h = pos_h[:, None] * inv_freq[None, :]
-        theta_w = pos_w[:, None] * inv_freq[None, :]
-        theta = torch.cat([theta_h, theta_w], dim=1)  # [seq_len, head_dim]
-
-        cos = torch.cos(theta)[None, None, :, :].to(dtype=dtype)  # [1,1,N,D]
-        sin = torch.sin(theta)[None, None, :, :].to(dtype=dtype)
-        self._rope_cache[key] = (cos, sin)
-        return cos, sin
-
-    def _apply_rope(self, q):
-        # q: (B, heads, N, head_dim)
-        cos, sin = self._get_rope(q.size(2), q.device, q.dtype)
-        # Clone to prevent CUDA graph issues with cached tensors
-        return (q * cos.clone()) + (self._rotate_half(q) * sin.clone())
 
     def _get_window_mask(self, seq_len, device, dtype):
         if self.window_size is None:
@@ -250,12 +200,6 @@ class DifferentialAttention(nn.Module):
             k2 = k2.repeat_interleave(repeat, dim=1)
             v1 = v1.repeat_interleave(repeat, dim=1)
             v2 = v2.repeat_interleave(repeat, dim=1)
-
-        if self.use_rope:
-            q1 = self._apply_rope(q1)
-            q2 = self._apply_rope(q2)
-            k1 = self._apply_rope(k1)
-            k2 = self._apply_rope(k2)
 
         if self.use_qk_norm:
             # Cast to float32 for norm operations (FP8 not supported by linalg.vector_norm)
