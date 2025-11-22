@@ -620,7 +620,8 @@ class Trainer:
             }
 
         # Total gradient norm (L2 norm across all parameters)
-        total_norm_tensor = torch.stack([torch.tensor(n) for n in total_norms])
+        # Optimized: create tensor directly from list instead of many small tensors
+        total_norm_tensor = torch.tensor(total_norms, device=self.device)
         total_norm = torch.norm(total_norm_tensor, 2).item()
 
         # Max gradient norm (to detect spikes in individual layers)
