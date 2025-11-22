@@ -27,6 +27,11 @@ except ImportError:
     TORCHAO_AVAILABLE = False
     convert_to_float8_training = None
 
+# Disable CUDA graphs for torch.compile (incompatible with matrix_exp in LieRE)
+# See: https://discuss.pytorch.org/t/cuda-graph-with-embedding-triggering-operation-not-permitted-when-stream-is-capturing/189311
+if hasattr(torch, '_inductor'):
+    torch._inductor.config.triton.cudagraphs = False
+
 def requires_grad(model, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
