@@ -144,12 +144,23 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
 
             # Main steps
             total_steps = max(1, args.num_sampling_steps - 1)
-            log_interval = max(1, total_steps // 10)  # Log 10 times during sampling
+            print(f"Starting {args.sampler.upper()} sampling: {total_steps} steps, stepsize={stepsize:.6f}, mu={args.mu}")
+            print(f"Initial state: xt.shape={xt.shape}, t[0]={t[0].item():.6f}")
+
+            import time
+            step_times = []
+
             for step_idx in range(total_steps):
+                step_start = time.time()
+
                 if args.sampler == 'gd':
+                    print(f"  [{step_idx+1}/{total_steps}] GD: Forward pass at t={t[0].item():.6f}")
                     out_obj = model_forward(xt, t)
                 else:  # ngd (look-ahead)
+                    print(f"  [{step_idx+1}/{total_steps}] NGD: Look-ahead prediction (mu={args.mu})")
                     x_pred = xt + stepsize * m * args.mu
+                    print(f"    x_pred norm: {x_pred.norm().item():.4f}, mean: {x_pred.mean().item():.6f}")
+                    print(f"    Forward pass at t={t[0].item():.6f}")
                     out_obj = model_forward(x_pred, t)
 
                 energy_batch = None
@@ -157,6 +168,9 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
                 if isinstance(out_obj, tuple):
                     out, energy_batch = out_obj
                     last_energy = energy_batch
+                    print(f"    Energy: {energy_batch[0].item():.6f}")
+
+                print(f"    Output norm: {out.norm().item():.4f}, mean: {out.mean().item():.6f}")
 
                 xt = xt + out * stepsize
                 t = t + stepsize
@@ -164,19 +178,40 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
 
                 if args.sampler == 'ngd':
                     m = out.detach()
+                    print(f"    Momentum updated, m norm: {m.norm().item():.4f}")
 
-                # Progress logging
-                if (step_idx + 1) % log_interval == 0 or step_idx == 0:
-                    print(f"  Sampling step {step_idx + 1}/{total_steps} (t={t[0].item():.4f})...")
+                step_time = time.time() - step_start
+                step_times.append(step_time)
+                avg_time = sum(step_times) / len(step_times)
+                eta = avg_time * (total_steps - step_idx - 1)
+
+                print(f"    xt norm: {xt.norm().item():.4f}, t[0]={t[0].item():.6f}")
+                print(f"    Step time: {step_time:.3f}s, Avg: {avg_time:.3f}s, ETA: {eta:.1f}s ({eta/60:.1f}m)")
+
+                if torch.cuda.is_available():
+                    mem_allocated = torch.cuda.memory_allocated(device) / 1e9
+                    mem_reserved = torch.cuda.memory_reserved(device) / 1e9
+                    print(f"    GPU mem: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
 
             # Final corrective step to land exactly at t=1 (prevents under-integration when stepsize is small).
             remaining = (1.0 - t).clamp(min=0.0)
+            print(f"\nFinal corrective step:")
+            print(f"  remaining: max={remaining.max().item():.6f}, mean={remaining.mean().item():.6f}")
             if remaining.max() > 1e-6:
+                print(f"  Applying final correction, forward pass at t={t[0].item():.6f}")
                 out_obj = model_forward(xt, t)
                 out_final = out_obj[0] if isinstance(out_obj, tuple) else out_obj
+                print(f"  Final output norm: {out_final.norm().item():.4f}")
                 xt = xt + out_final * remaining.view(-1, 1, 1, 1)
                 t = torch.ones_like(t)
                 step_counts += (remaining > 0).int()
+                print(f"  Final xt norm: {xt.norm().item():.4f}, t[0]={t[0].item():.6f}")
+            else:
+                print(f"  No correction needed (remaining < 1e-6)")
+
+            print(f"\nSampling complete! Total steps taken: {step_counts[0].item()}")
+            print(f"Average step time: {sum(step_times)/len(step_times):.3f}s")
+            print(f"Total sampling time: {sum(step_times):.1f}s ({sum(step_times)/60:.1f}m)")
 
             per_sample_counts = step_counts[:current_batch_size] if cfg_on else step_counts
             all_step_counts.append(per_sample_counts.cpu())
@@ -208,21 +243,39 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
             all_step_counts.append(torch.full((current_batch_size,), args.num_sampling_steps, dtype=torch.int))
 
         if cfg_on:
+            print(f"\nCFG: Splitting conditional/unconditional outputs")
+            print(f"  Before split: xt.shape={xt.shape}")
             xt, _ = xt.chunk(2, dim=0)
+            print(f"  After split: xt.shape={xt.shape}")
 
+        print(f"\nDecoding latents to images...")
+        print(f"  Latent shape: {xt.shape}, norm: {xt.norm().item():.4f}")
+        decode_start = time.time()
         with torch.no_grad():
             samples = decode_latents(vae, xt, device)
+        decode_time = time.time() - decode_start
+        print(f"  Decoded to shape: {samples.shape}, time: {decode_time:.3f}s")
+        print(f"  Sample range: [{samples.min().item():.3f}, {samples.max().item():.3f}]")
 
         if return_stats:
             sample_tensors.append(samples.detach().cpu())
 
+        print(f"\nPost-processing and saving images...")
         samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+        print(f"  Uint8 range: [{samples.min()}, {samples.max()}]")
 
+        save_start = time.time()
         for j, sample in enumerate(samples):
-            Image.fromarray(sample).save(f"{output_dir}/{total_generated + j:05d}.png")
+            save_path = f"{output_dir}/{total_generated + j:05d}.png"
+            Image.fromarray(sample).save(save_path)
+            print(f"  Saved: {save_path}")
+        save_time = time.time() - save_start
+        print(f"  Save time: {save_time:.3f}s")
 
         total_generated += current_batch_size
-        print(f"Generated {total_generated}/{n} samples.")
+        print(f"\n{'='*60}")
+        print(f"Batch complete! Generated {total_generated}/{n} samples.")
+        print(f"{'='*60}\n")
 
     images = [Image.open(f"{output_dir}/{i:05d}.png") for i in range(n)]
 
