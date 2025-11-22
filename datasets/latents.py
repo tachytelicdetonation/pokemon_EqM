@@ -51,10 +51,11 @@ class MixedLatentMasking:
         return x * mask
 
 class LatentDataset(Dataset):
-    def __init__(self, root_dir, load_to_memory=True):
+    def __init__(self, root_dir, load_to_memory=True, augment=True):
         self.root_dir = root_dir
         self.latent_paths = sorted(glob(os.path.join(root_dir, "*.pt")))
         self.load_to_memory = load_to_memory
+        self.augment = augment
         
         print(f"Found {len(self.latent_paths)} latents in {root_dir}")
         
@@ -81,9 +82,10 @@ class LatentDataset(Dataset):
         else:
             latent = torch.load(self.latent_paths[idx])
             
-        # Apply augmentations
-        latent = self.flip(latent)
-        latent = self.masking(latent)
+        # Apply augmentations only if enabled
+        if self.augment:
+            latent = self.flip(latent)
+            latent = self.masking(latent)
             
         # Return label 0 for all images
         label = 0

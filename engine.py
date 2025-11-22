@@ -92,7 +92,23 @@ class Trainer:
         self.val_reference = None
         if self.metrics.available:
             try:
-                batch, _ = next(iter(loader))
+                # We need a clean batch (no masking/flipping) for FID reference
+                # If using cached latents, we can create a clean dataset
+                if getattr(self.args, "cache_latents", False):
+                    from datasets.latents import LatentDataset
+                    from torch.utils.data import DataLoader
+                    # Re-use path from args or assume default
+                    latent_dir = os.path.join("data", "latents")
+                    # Load without augmentation
+                    clean_dataset = LatentDataset(latent_dir, load_to_memory=False, augment=False)
+                    clean_loader = DataLoader(clean_dataset, batch_size=getattr(self.args, "metrics_subset_size", 16))
+                    batch, _ = next(iter(clean_loader))
+                else:
+                    # If not using latents, we assume the main loader is fine (or we accept augs)
+                    # But ideally we want clean images. 
+                    # For now, fallback to loader but note it might have flips.
+                    batch, _ = next(iter(loader))
+
                 take = min(getattr(self.args, "metrics_subset_size", 16), batch.size(0))
                 ref = batch[:take].to(device)
                 
