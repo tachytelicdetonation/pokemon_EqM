@@ -3,7 +3,7 @@
   "image_size": 64,
   "batch_size": 8,
   "epochs": 100,
-  "log_every": 10,
+  "log_every": 50,
   "ckpt_every": 200,
   "seed": 123,
   "num_samples": 1,

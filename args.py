@@ -24,7 +24,7 @@ def get_args():
         "lr": 1e-4,
         "weight_decay": 0,
         "num_workers": 4,
-        "log_every": 10,
+        "log_every": 100,
         "ckpt_every": 1000,
         "run_id": None,
         "ckpt": None,
