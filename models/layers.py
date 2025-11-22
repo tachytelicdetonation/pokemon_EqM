@@ -207,11 +207,12 @@ class LieRE(nn.Module):
         # Reshape for batched matrix multiplication
         x_flat = x.reshape(B * num_heads, seq_len, head_dim)  # [B*num_heads, seq_len, head_dim]
 
-        # Apply rotations: [B*num_heads, seq_len, head_dim] @ [seq_len, head_dim, head_dim]
-        # We need to apply different rotation to each position
-        output = torch.zeros_like(x_flat)
-        for i in range(seq_len):
-            output[:, i, :] = x_flat[:, i, :] @ rotations[i].T
+        # Vectorized rotation application using einsum (NO LOOPS!)
+        # x_flat: [B*num_heads, seq_len, head_dim]
+        # rotations: [seq_len, head_dim, head_dim]
+        # For each position i: output[:, i, :] = x_flat[:, i, :] @ rotations[i].T
+        # Einsum notation: 'bnd,ned->bne' where b=batch, n=seq_len, d=head_dim, e=head_dim
+        output = torch.einsum('bnd,ned->bne', x_flat, rotations)
 
         # Reshape back
         output = output.reshape(B, num_heads, seq_len, head_dim)
