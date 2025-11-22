@@ -8,6 +8,7 @@ def get_args():
     parser.add_argument("--config", type=str, default="test", help="Path to JSON config file or name of config (production/test)")
     parser.add_argument("--ckpt", type=str, help="Path to checkpoint for generation/resuming")
     parser.add_argument("--run_id", type=str, help="Run ID to resume from (or directory name)")
+    parser.add_argument("--seed", type=int, default=None, help="Optional random seed for reproducible sampling/training. Omit for stochastic runs.")
     args = parser.parse_args()
 
     # Default configuration
@@ -40,13 +41,16 @@ def get_args():
         "sample_eps": None,
         "train_eps": None,
         "num_samples": 5,
-        "stepsize": 0.0017,
+        # Sampling step size: leave None to auto-span [sample_eps, 1] over num_sampling_steps.
+        # Override in JSON config if you need a custom fixed dt.
+        "stepsize": None,
         "num_sampling_steps": 250,
         "sampler": "ngd",
         "mu": 0.3,
         "stepsize_mult": 1.0,
         "sample_batch_size": 8,
         "output_dir": "generated_samples",
+        # Default seed for deterministic sampling/training; override via config or --seed
         "seed": 42,
         "log_images": True,
         "watch_grads": False,
@@ -84,6 +88,14 @@ def get_args():
         config['ckpt'] = args.ckpt
     if args.run_id:
         config['run_id'] = args.run_id
+    if args.seed is not None:
+        config['seed'] = args.seed
+    # Default to stochastic behavior if seed is absent in config
+    if 'seed' not in config:
+        config['seed'] = None
+    # Treat negative seed values as a signal for stochastic runs
+    if isinstance(config.get('seed'), int) and config['seed'] < 0:
+        config['seed'] = None
 
     # Normalize legacy sentinel
     if str(config.get('energy_head', 'implicit')).lower() == 'none':

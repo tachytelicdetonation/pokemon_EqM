@@ -83,7 +83,7 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
 
     cfg_scale = min(args.cfg_scale, getattr(args, "cfg_scale_cap", args.cfg_scale))
     sample_eps = float(getattr(args, "sample_eps", 0.0) or 0.0)
-    # If the user didn't tune stepsize explicitly, traverse [sample_eps, 1] evenly.
+    # Step size handling: auto-span [sample_eps, 1] if user didn't set stepsize.
     user_stepsize = getattr(args, "stepsize", None)
     base_dt = (1.0 - sample_eps) / max(1, args.num_sampling_steps) if user_stepsize is None else user_stepsize
     stepsize = base_dt * getattr(args, "stepsize_mult", 1.0)
@@ -97,8 +97,6 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
 
     total_generated = 0
 
-    grad_norm_sums = torch.zeros(args.num_sampling_steps, dtype=torch.float64)
-    grad_norm_counts = torch.zeros(args.num_sampling_steps, dtype=torch.float64)
     all_step_counts = []
     all_energy = []
     sample_tensors = []
@@ -121,8 +119,8 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
             z = torch.randn(current_batch_size, in_channels, args.image_size // 8, args.image_size // 8, device=device)
 
         y = torch.zeros(current_batch_size, dtype=torch.long, device=device)
-        # Start integration at sample_eps (0 by default) and march forward to t=1.
-        t = torch.full((current_batch_size,), sample_eps, device=device)
+        # Start integration at sample_eps (0 by default).
+        t = torch.ones((current_batch_size,), device=device) * sample_eps
 
         cfg_on = cfg_scale > 1.0
         if cfg_on:
@@ -140,65 +138,45 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
             return model.forward(x_in, t_in, y, get_energy=collect_energy)
 
         if args.sampler in ['gd', 'ngd']:
-            context = torch.no_grad() if energy_head == 'implicit' else torch.enable_grad()
-            with context:
-                step_counts = torch.zeros(xt.shape[0], device=device, dtype=torch.int)
-                finished = torch.zeros(xt.shape[0], device=device, dtype=torch.bool)
-                last_energy = None
+            # Deterministic Euler steps; ensure we reach t=1 by a final correction step.
+            step_counts = torch.zeros(xt.shape[0], device=device, dtype=torch.int)
+            last_energy = None
 
-                for step in range(args.num_sampling_steps):
-                    active = ~finished
-                    if not active.any():
-                        break
+            # Main steps
+            for _ in range(max(1, args.num_sampling_steps - 1)):
+                if args.sampler == 'gd':
+                    out_obj = model_forward(xt, t)
+                else:  # ngd (look-ahead)
+                    x_pred = xt + stepsize * m * args.mu
+                    out_obj = model_forward(x_pred, t)
 
-                    if args.sampler == 'gd':
-                        out_obj = model_forward(xt, t)
-                    else:  # ngd
-                        x_pred = xt
-                        if active.any():
-                            x_pred = xt.clone()
-                            x_pred[active] = xt[active] + stepsize * m[active] * args.mu
-                        out_obj = model_forward(x_pred, t)
+                energy_batch = None
+                out = out_obj
+                if isinstance(out_obj, tuple):
+                    out, energy_batch = out_obj
+                    last_energy = energy_batch
 
-                    energy_batch = None
-                    out = out_obj
-                    if isinstance(out_obj, tuple):
-                        out, energy_batch = out_obj
-                        last_energy = energy_batch
+                xt = xt + out * stepsize
+                t = t + stepsize
+                step_counts += 1
 
-                    grad_norm = out.view(out.size(0), -1).norm(dim=1)
-                    grad_norm_sums[step] += grad_norm.detach().cpu().mean()
-                    grad_norm_counts[step] += 1
+                if args.sampler == 'ngd':
+                    m = out.detach()
 
-                    if adaptive:
-                        step_counts[active] += 1
-                        if step + 1 >= min_adaptive_steps:
-                            newly_finished = grad_norm < grad_thresh
-                            finished = finished | newly_finished
-                    else:
-                        step_counts += 1
+            # Final corrective step to land exactly at t=1 (prevents under-integration when stepsize is small).
+            remaining = (1.0 - t).clamp(min=0.0)
+            if remaining.max() > 1e-6:
+                out_obj = model_forward(xt, t)
+                out_final = out_obj[0] if isinstance(out_obj, tuple) else out_obj
+                xt = xt + out_final * remaining.view(-1, 1, 1, 1)
+                t = torch.ones_like(t)
+                step_counts += (remaining > 0).int()
 
-                    # Clamp dt to avoid overshooting t>1
-                    dt = torch.full_like(t, stepsize)
-                    remaining = (1.0 - t).clamp(min=0.0)
-                    dt = torch.minimum(dt, remaining)
-
-                    out = out * active.view(-1, 1, 1, 1)
-                    xt = xt + out * dt.view(-1, 1, 1, 1)
-                    t = t + active.float() * dt
-
-                    xt = xt.detach()
-                    if args.sampler == 'ngd':
-                        m = out.detach()
-
-                    # Mark samples that have reached t >= 1
-                    finished = finished | (t >= 1.0 - 1e-6)
-
-                per_sample_counts = step_counts[:current_batch_size] if cfg_on else step_counts
-                all_step_counts.append(per_sample_counts.cpu())
-                if last_energy is not None:
-                    energy_main = last_energy[:current_batch_size] if cfg_on else last_energy
-                    all_energy.append(energy_main.detach().cpu())
+            per_sample_counts = step_counts[:current_batch_size] if cfg_on else step_counts
+            all_step_counts.append(per_sample_counts.cpu())
+            if last_energy is not None:
+                energy_main = last_energy[:current_batch_size] if cfg_on else last_energy
+                all_energy.append(energy_main.detach().cpu())
 
         elif args.sampler.startswith('ode'):
             sampler = Sampler(transport)
@@ -245,7 +223,7 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
     if not return_stats:
         return images
 
-    grad_trace = (grad_norm_sums / torch.clamp(grad_norm_counts, min=1)).tolist()
+    grad_trace = []
     step_counts_tensor = torch.cat(all_step_counts, dim=0) if all_step_counts else torch.zeros(0)
     energy_tensor = torch.cat(all_energy, dim=0) if all_energy else None
     stats = {
@@ -264,13 +242,16 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
 def main():
     args = get_args()
     
-    # Set seed
-    if args.seed is not None:
-        print(f"Setting seed to {args.seed}")
-        torch.manual_seed(args.seed)
-        np.random.seed(args.seed)
+    # Set seed (optional)
+    seed = getattr(args, "seed", None)
+    if seed is not None:
+        print(f"Setting seed to {seed} (deterministic sampling).")
+        torch.manual_seed(seed)
+        np.random.seed(seed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(args.seed)
+            torch.cuda.manual_seed_all(seed)
+    else:
+        print("No seed provided; sampling will be stochastic each run.")
 
     # Setup device
     if torch.backends.mps.is_available():

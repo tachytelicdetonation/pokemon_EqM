@@ -89,10 +89,14 @@ def initialize(args, entity, exp_name, project_name):
     if args.config == 'testing':
         return run_id, run_name
     
+    seed_tag = None
+    if getattr(args, "seed", None) is not None:
+        seed_tag = f"seed_{getattr(args, 'seed')}"
+
     tags = [
         str(getattr(args, "model", "")),
         f"size_{getattr(args, 'image_size', '')}",
-        f"seed_{getattr(args, 'seed', '')}",
+        seed_tag,
         f"config_{getattr(args, 'config', '')}",
         os.path.basename(getattr(args, "data_path", "")) if getattr(args, "data_path", None) else None,
     ]
