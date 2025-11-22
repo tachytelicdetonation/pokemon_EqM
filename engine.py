@@ -205,7 +205,7 @@ class Trainer:
                 amp_context = (
                     torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype)
                     if self.use_amp
-                    else torch.cuda.amp.autocast(enabled=False)
+                    else torch.amp.autocast(device_type="cuda", enabled=False)
                 )
 
                 with amp_context:

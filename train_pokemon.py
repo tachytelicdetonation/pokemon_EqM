@@ -68,8 +68,18 @@ def main():
     use_torchao_fp8 = False
     if getattr(args, 'mixed_precision', None) == 'fp8':
         if TORCHAO_AVAILABLE:
-            logger.info("Converting model to float8 training with torchao...")
-            convert_to_float8_training(model)
+            from torchao.float8 import Float8LinearConfig, ScalingType
+
+            # Use rowwise scaling for better accuracy (recommended best practice)
+            # Options: "tensorwise" (fastest), "rowwise" (best accuracy/perf), "rowwise_with_gw_hp" (most accurate)
+            config = Float8LinearConfig(
+                scaling_type_input=ScalingType.DYNAMIC,
+                scaling_type_weight=ScalingType.DYNAMIC,
+                scaling_type_grad_output=ScalingType.DYNAMIC,
+            )
+
+            logger.info("Converting model to float8 training with torchao (rowwise scaling)...")
+            convert_to_float8_training(model, config=config)
             use_torchao_fp8 = True
             logger.info("Float8 conversion complete")
         else:
