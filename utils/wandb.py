@@ -131,20 +131,31 @@ def log_image(sample, step=None):
         wandb.log({f"samples": wandb.Image(sample), "train_step": step})
 
 
-def log_samples_table(rows, step=None, preview_image=None):
+def log_samples_table(rows, step=None, preview_image=None, preview_images=None):
     """
-    rows: list of dicts with keys train_step, index, seed, label, file_path
-    preview_image: optional wandb.Image to log separately
+    rows: list of dicts with keys train_step, index, seed, label, file_path, sampler, num_steps, cfg_scale
+    preview_image: optional single wandb.Image to log (deprecated, use preview_images)
+    preview_images: optional list of wandb.Image to log separately
     """
     if not (is_main_process() and wandb.run is not None):
         return
-    columns = ["train_step", "index", "seed", "label", "file_path"]
+
+    # Determine columns based on what's in the rows
+    base_columns = ["train_step", "index", "seed", "label", "file_path"]
+    extra_columns = ["sampler", "num_steps", "cfg_scale"]
+    columns = base_columns + [col for col in extra_columns if any(col in row for row in rows)]
+
     table = wandb.Table(columns=columns)
     for row in rows:
         table.add_data(*(row.get(col) for col in columns))
     to_log = {"sample_trace": table}
-    if preview_image is not None:
+
+    # Handle preview images
+    if preview_images is not None:
+        to_log["generated_samples"] = preview_images
+    elif preview_image is not None:
         to_log["generated_sample"] = preview_image
+
     wandb.log(to_log, step=step)
 
 

@@ -7,3 +7,4 @@ torchdiffeq
 wandb
 schedulefree
 torchmetrics[image]
+lpips
