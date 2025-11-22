@@ -12,6 +12,12 @@ from datasets import PokemonDataset
 from args import get_args
 from engine import Trainer
 
+# Mixed precision support
+try:
+    from torch.cuda.amp import GradScaler
+except ImportError:
+    GradScaler = None
+
 def requires_grad(model, flag=True):
     for p in model.parameters():
         p.requires_grad = flag
@@ -23,6 +29,10 @@ def main():
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print("Using CUDA device.")
+        # Enable TF32 for better performance on Ampere+ GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
         print("Using MPS device.")
@@ -45,6 +55,13 @@ def main():
         uncond=args.uncond,
         energy_head=args.energy_head
     ).to(device)
+
+    # Compile model for faster execution (PyTorch 2.0+)
+    if getattr(args, 'compile', False):
+        logger.info(f"Compiling model with torch.compile (mode={getattr(args, 'compile_mode', 'default')})...")
+        compile_mode = getattr(args, 'compile_mode', 'default')
+        model = torch.compile(model, mode=compile_mode)
+        logger.info("Model compilation complete")
 
     ema = deepcopy(model).to(device)
     requires_grad(ema, False)
@@ -89,11 +106,33 @@ def main():
     # Scheduler
     lr_scheduler = None
 
+    # Setup mixed precision training
+    scaler = None
+    amp_dtype = None
+    use_amp = getattr(args, 'mixed_precision', None)
+
+    if use_amp and device.type == 'cuda':
+        # Map precision string to dtype
+        dtype_map = {
+            'fp16': torch.float16,
+            'bf16': torch.bfloat16,
+            'fp8': torch.float8_e4m3fn if hasattr(torch, 'float8_e4m3fn') else torch.bfloat16,
+        }
+        amp_dtype = dtype_map.get(use_amp, torch.bfloat16)
+
+        # GradScaler only needed for fp16, not bf16 or fp8
+        if use_amp == 'fp16' and GradScaler is not None:
+            scaler = GradScaler()
+            logger.info("Using mixed precision training: fp16 with GradScaler")
+        else:
+            logger.info(f"Using mixed precision training: {use_amp} (dtype={amp_dtype})")
+
     model.train()
     opt.train()
     ema.eval()
     # Trainer
-    trainer = Trainer(model, ema, opt, transport, vae, loader, lr_scheduler, device, args)
+    trainer = Trainer(model, ema, opt, transport, vae, loader, lr_scheduler, device, args,
+                     scaler=scaler, amp_dtype=amp_dtype)
     
     # Resume logic
     start_epoch = 0

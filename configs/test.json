@@ -10,5 +10,7 @@
   "num_sampling_steps": 1,
   "output_dir": "test_run_config",
   "vae_path": "qwen_image_vae.safetensors",
-  "data_path": "data/raw"
+  "data_path": "data/raw",
+  "mixed_precision": false,
+  "compile": false
 }

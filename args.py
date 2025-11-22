@@ -54,6 +54,11 @@ def get_args():
         "seed": 42,
         "log_images": True,
         "watch_grads": False,
+        # Gradient clipping for training stability (common for diffusion models: 0.1-1.0)
+        # Set to 0 to disable, or positive value to enable
+        "grad_clip": 1.0,
+        "log_layer_grads": True,  # Log per-layer gradient stats at checkpoint time
+        "log_layer_histogram": False,  # Log histogram of layer gradient norms (expensive)
         # Adaptive early-stop for sampling is off by default to avoid zero-step samples on fresh models.
         "adaptive": False,
         "min_adaptive_steps": 10,
@@ -61,6 +66,11 @@ def get_args():
         "sigreg_lambda": 0.1,
         "noised_input_path": None,
         "metrics_subset_size": 16,
+        # Training optimizations (H100/H200 optimized defaults)
+        "mixed_precision": "fp8",  # Options: "fp8", "bf16", "fp16", or False/None for fp32
+        "compile": True,  # Enable torch.compile for faster execution
+        "compile_mode": "max-autotune",  # Options: "default", "reduce-overhead", "max-autotune"
+        "cache_latents": True,  # Cache VAE-encoded latents (requires preprocessing)
     }
 
     # Load config from JSON

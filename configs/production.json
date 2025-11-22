@@ -2,5 +2,10 @@
     "model": "EqM-XL/2",
     "image_size": 256,
     "batch_size": 32,
-    "epochs": 1000
+    "epochs": 1000,
+    "mixed_precision": "fp8",
+    "compile": true,
+    "compile_mode": "max-autotune",
+    "grad_clip": 1.0,
+    "cache_latents": true
 }
