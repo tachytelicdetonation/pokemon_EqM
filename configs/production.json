@@ -6,10 +6,12 @@
   "log_every": 100,
   "sample_every": 1000,
   "ckpt_every": 1000,
-  "mixed_precision": "bf16",
+  "mixed_precision": "fp8",
   "compile": false,
   "grad_clip": 1.0,
   "cache_latents": true,
   "stepsize": 0.0017,
-  "cfg_scale": 4.0
+  "cfg_scale": 4.0,
+  "use_liere": true,
+  "use_rope": false
 }

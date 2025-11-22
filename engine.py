@@ -584,8 +584,11 @@ class Trainer:
         total = 0
         layer_stats = {}  # Per-layer tracking
 
-        # For GSNR calculation: collect all gradient values
-        all_grad_values = []
+        # For GSNR calculation: use online statistics (NO concatenation!)
+        # This avoids OOM from creating a 3.49 GiB tensor
+        sum_grads = 0.0
+        sum_sq_grads = 0.0
+        count_grads = 0
 
         for name, p in self.model.named_parameters():
             if p.grad is not None:
@@ -596,8 +599,10 @@ class Trainer:
                 nonzero += torch.count_nonzero(g).item()
                 total += g.numel()
 
-                # Collect gradient values for GSNR (flatten to 1D)
-                all_grad_values.append(g.flatten())
+                # Accumulate statistics for GSNR (memory efficient)
+                sum_grads += g.sum().item()
+                sum_sq_grads += (g ** 2).sum().item()
+                count_grads += g.numel()
 
                 # Per-layer stats for detailed monitoring (checkpoint time only)
                 layer_stats[name] = {
@@ -630,9 +635,11 @@ class Trainer:
         # Gradient Signal-to-Noise Ratio (GSNR) - OpenAI's metric
         # GSNR = ||E[gradients]||² / Var(gradients)
         # High GSNR = strong signal, low GSNR = noisy gradients
-        all_grads = torch.cat(all_grad_values)
-        grad_mean = all_grads.mean().item()
-        grad_var = all_grads.var().item()
+
+        # Compute mean and variance from accumulated statistics (memory efficient)
+        # Var(X) = E[X²] - E[X]²
+        grad_mean = sum_grads / count_grads if count_grads > 0 else 0.0
+        grad_var = (sum_sq_grads / count_grads - grad_mean ** 2) if count_grads > 0 else 0.0
 
         # Compute GSNR with epsilon to prevent division by zero
         epsilon = 1e-10
