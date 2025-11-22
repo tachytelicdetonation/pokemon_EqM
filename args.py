@@ -9,6 +9,13 @@ def get_args():
     parser.add_argument("--ckpt", type=str, help="Path to checkpoint for generation/resuming")
     parser.add_argument("--run_id", type=str, help="Run ID to resume from (or directory name)")
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed for reproducible sampling/training. Omit for stochastic runs.")
+    
+    # Overrides
+    parser.add_argument("--epochs", type=int, help="Override number of epochs")
+    parser.add_argument("--batch_size", type=int, help="Override batch size")
+    parser.add_argument("--log_every", type=int, help="Override log frequency")
+    parser.add_argument("--cache_latents", action="store_true", help="Enable latent caching")
+    
     args = parser.parse_args()
 
     # Default configuration
@@ -100,6 +107,16 @@ def get_args():
         config['run_id'] = args.run_id
     if args.seed is not None:
         config['seed'] = args.seed
+        
+    # Apply overrides
+    if args.epochs is not None:
+        config['epochs'] = args.epochs
+    if args.batch_size is not None:
+        config['batch_size'] = args.batch_size
+    if args.log_every is not None:
+        config['log_every'] = args.log_every
+    if args.cache_latents:
+        config['cache_latents'] = True
     # Default to stochastic behavior if seed is absent in config
     if 'seed' not in config:
         config['seed'] = None

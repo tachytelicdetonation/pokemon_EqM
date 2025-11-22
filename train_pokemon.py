@@ -9,6 +9,7 @@ from models import EqM_models
 from transport import create_transport
 from utils.vae import load_vae
 from datasets import PokemonDataset
+from datasets.latents import LatentDataset
 from args import get_args
 from engine import Trainer
 
@@ -114,14 +115,35 @@ def main():
     requires_grad(vae, False)
 
     # Data
-    transform = transforms.Compose([
-        transforms.Resize((args.image_size, args.image_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    ])
+    if getattr(args, 'cache_latents', False):
+        import os
+        latent_dir = os.path.join("data", "latents")
+        if not os.path.exists(latent_dir) or not os.listdir(latent_dir):
+            logger.info("Latents not found. Running precomputation...")
+            # We could run the script here, or just error out. 
+            # For robustness, let's run the logic inline or call the script.
+            # Calling the script via subprocess is safer to avoid import issues/state pollution
+            import subprocess
+            import sys
+            subprocess.run([sys.executable, "scripts/precompute_latents.py", 
+                            "--data_path", args.data_path, 
+                            "--output_dir", latent_dir,
+                            "--image_size", str(args.image_size),
+                            "--vae_path", args.vae_path], check=True)
+            
+        dataset = LatentDataset(latent_dir, load_to_memory=True)
+        logger.info(f"Using cached latents from {latent_dir}")
+    else:
+        transform = transforms.Compose([
+            transforms.Resize((args.image_size, args.image_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+        
+        dataset = PokemonDataset(args.data_path, transform=transform)
+        logger.info("Using raw images (on-the-fly encoding)")
     
-    dataset = PokemonDataset(args.data_path, transform=transform)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -131,7 +153,7 @@ def main():
         drop_last=True
     )
     
-    logger.info(f"Dataset contains {len(dataset)} images")
+    logger.info(f"Dataset contains {len(dataset)} items")
 
     # Scheduler
     lr_scheduler = None

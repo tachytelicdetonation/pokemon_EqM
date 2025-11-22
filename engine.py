@@ -55,28 +55,16 @@ class Trainer:
         self.use_amp = amp_dtype is not None
 
         self.train_steps = 0
-        self.log_steps = 0
-        self.running_loss = 0
         self.start_time = time()
-        self.grad_norm_sum = 0.0
-        self.grad_norm_count = 0
-        self.grad_nonzero_sum = 0
-        self.grad_total_sum = 0
-        # Enhanced gradient health tracking
-        self.grad_max_norm_sum = 0.0
-        self.grad_mean_norm_sum = 0.0
-        self.grad_std_norm_sum = 0.0
-        self.grad_p50_sum = 0.0
-        self.grad_p95_sum = 0.0
-        self.grad_p99_sum = 0.0
-        self.grad_clip_count = 0  # Track how often gradients are clipped
+        self.last_log_time = time()
+        self.steps_since_last_log = 0
         self.last_grad_stats = None  # Store last grad stats for per-layer logging
         # Lower decay for faster EMA updates with smaller dataset
         self.ema_decay = 0.999  # Changed from 0.9999 to 0.999 (10x faster)
+        self.sigreg_enabled = getattr(self.args, "sigreg_lambda", 0) > 0
         self.sigreg_loss_sum = 0.0
         self.sigreg_var_sum = 0.0
         self.sigreg_var_count = 0
-        self.sigreg_enabled = getattr(self.args, "sigreg_lambda", 0) > 0
 
         # Fixed noise for consistent sampling
         # Determine latent channels from model or args
@@ -198,8 +186,11 @@ class Trainer:
                 x = x.to(self.device)
                 y = y.to(self.device)
 
-                with torch.no_grad():
-                    x = encode_latents(self.vae, x, self.device)
+                # If using cached latents, x is already a latent tensor.
+                # Otherwise, encode it.
+                if not getattr(self.args, "cache_latents", False):
+                    with torch.no_grad():
+                        x = encode_latents(self.vae, x, self.device)
 
                 # Mixed precision training context
                 amp_context = (
@@ -244,32 +235,44 @@ class Trainer:
                 else:
                     loss.backward()
 
-                # Compute gradient statistics before clipping
-                grad_stats = self.compute_grad_stats()
-                self.last_grad_stats = grad_stats  # Store for per-layer logging
+                # Only compute expensive stats and log if it's a logging step
+                is_log_step = (self.train_steps % self.args.log_every == 0)
+                
+                grad_stats = None
+                was_clipped = False
+                
+                if is_log_step:
+                    # Compute gradient statistics before clipping
+                    grad_stats = self.compute_grad_stats()
+                    self.last_grad_stats = grad_stats  # Store for per-layer logging
+
+                # SIGReg loss tracking
+                sigreg_loss_value = None
+                sigreg_var_value = None
+                if self.sigreg_enabled:
+                    penultimate = loss_dict.get("penultimate")
+                    if penultimate is not None:
+                        sigreg_loss_value = sig_loss.item()
+                        sigreg_var_value = proj_var.mean().item()
 
                 # Gradient clipping (common for diffusion models: 0.1-1.0)
                 clip_value = getattr(self.args, "grad_clip", 1.0)
+                
                 if clip_value > 0:
-                    unclipped_norm = grad_stats["total_norm"]
+                    # If we didn't compute stats yet but need to clip, we might need to compute norm
+                    # But clip_grad_norm_ computes it anyway.
                     if self.scaler is not None:
                         self.scaler.unscale_(self.opt)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_value)
-                    # Track if clipping occurred
-                    if unclipped_norm > clip_value:
-                        self.grad_clip_count += 1
-
-                # Accumulate gradient statistics
-                self.grad_norm_sum += grad_stats["total_norm"]
-                self.grad_norm_count += 1
-                self.grad_nonzero_sum += grad_stats["nonzero"]
-                self.grad_total_sum += grad_stats["total"]
-                self.grad_max_norm_sum += grad_stats["max_norm"]
-                self.grad_mean_norm_sum += grad_stats["mean_norm"]
-                self.grad_std_norm_sum += grad_stats["std_norm"]
-                self.grad_p50_sum += grad_stats["percentile_50"]
-                self.grad_p95_sum += grad_stats["percentile_95"]
-                self.grad_p99_sum += grad_stats["percentile_99"]
+                    
+                    # We can capture the norm from clip_grad_norm_
+                    unclipped_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_value)
+                    
+                    if is_log_step and grad_stats is not None:
+                         # Update total_norm with the one computed by clip_grad_norm_ if we want exact consistency
+                         # or just rely on our pre-computed one. 
+                         # Actually, clip_grad_norm_ returns the norm BEFORE clipping.
+                         if unclipped_norm > clip_value:
+                             was_clipped = True
 
                 # Optimizer step with mixed precision support
                 if self.scaler is not None:
@@ -281,12 +284,13 @@ class Trainer:
                     self.lr_scheduler.step()
                 update_ema(self.ema, self.model, decay=self.ema_decay)
 
-                self.running_loss += loss.item()
-                self.log_steps += 1
                 self.train_steps += 1
+                self.steps_since_last_log += 1
 
-                if self.train_steps % self.args.log_every == 0:
-                    self.log_metrics()
+                # Log metrics to wandb only on log steps
+                if is_log_step:
+                    self.log_step_metrics(loss.item(), grad_stats, sigreg_loss_value, sigreg_var_value, was_clipped)
+                    self.print_terminal_metrics()
 
                 if (
                     self.train_steps % self.args.ckpt_every == 0
@@ -295,58 +299,22 @@ class Trainer:
                     self.save_checkpoint()
                     self.generate_samples()
 
-    def log_metrics(self):
-        end_time = time()
-        steps_per_sec = self.log_steps / (end_time - self.start_time)
-        avg_loss = self.running_loss / self.log_steps
-        logger.info(
-            f"(step={self.train_steps:07d}) Train Loss: {avg_loss:.4f}, Steps/Sec: {steps_per_sec:.2f}"
-        )
-
+    def log_step_metrics(self, loss_value, grad_stats, sigreg_loss_value, sigreg_var_value, was_clipped):
+        """Log metrics to wandb immediately after each training step."""
+        # Get current learning rate
         if self.lr_scheduler is not None:
             current_lr = self.lr_scheduler.get_last_lr()[0]
         else:
-            # Schedule-free path: log the (constant) optimizer LR
             current_lr = self.opt.param_groups[0].get("lr", 0.0)
-        # Compute gradient statistics
-        avg_grad_norm = (
-            self.grad_norm_sum / self.grad_norm_count if self.grad_norm_count else 0.0
-        )
+
+        # Compute gradient fraction nonzero
         frac_nonzero = (
-            (self.grad_nonzero_sum / self.grad_total_sum)
-            if self.grad_total_sum
+            grad_stats["nonzero"] / grad_stats["total"]
+            if grad_stats["total"] > 0
             else 0.0
         )
 
-        # Enhanced gradient health metrics
-        avg_max_norm = (
-            self.grad_max_norm_sum / self.grad_norm_count
-            if self.grad_norm_count
-            else 0.0
-        )
-        avg_mean_norm = (
-            self.grad_mean_norm_sum / self.grad_norm_count
-            if self.grad_norm_count
-            else 0.0
-        )
-        avg_std_norm = (
-            self.grad_std_norm_sum / self.grad_norm_count
-            if self.grad_norm_count
-            else 0.0
-        )
-        avg_p50 = (
-            self.grad_p50_sum / self.grad_norm_count if self.grad_norm_count else 0.0
-        )
-        avg_p95 = (
-            self.grad_p95_sum / self.grad_norm_count if self.grad_norm_count else 0.0
-        )
-        avg_p99 = (
-            self.grad_p99_sum / self.grad_norm_count if self.grad_norm_count else 0.0
-        )
-        clip_frequency = (
-            self.grad_clip_count / self.grad_norm_count if self.grad_norm_count else 0.0
-        )
-
+        # CUDA memory
         cuda_mem_alloc = (
             torch.cuda.memory_allocated(self.device)
             if torch.cuda.is_available() and self.device.type == "cuda"
@@ -357,52 +325,43 @@ class Trainer:
             if torch.cuda.is_available() and self.device.type == "cuda"
             else 0
         )
+
+        # Build metrics dict with industry-standard gradient health metrics only
         stats = {
-            "train/loss": avg_loss,
-            "train/steps_per_sec": steps_per_sec,
+            "train/loss": loss_value,
             "train/learning_rate": current_lr,
             "train/ema_decay": self.ema_decay,
-            # Gradient health metrics
-            "grad/norm": avg_grad_norm,
-            "grad/max_norm": avg_max_norm,
-            "grad/mean_norm": avg_mean_norm,
-            "grad/std_norm": avg_std_norm,
-            "grad/percentile_50": avg_p50,
-            "grad/percentile_95": avg_p95,
-            "grad/percentile_99": avg_p99,
+            # Core gradient health metrics (industry standard)
+            "grad/norm": grad_stats["total_norm"],
+            "grad/max_norm": grad_stats["max_norm"],
             "grad/fraction_nonzero": frac_nonzero,
-            "grad/clip_frequency": clip_frequency,
+            "grad/was_clipped": 1.0 if was_clipped else 0.0,
             # System metrics
             "system/cuda_mem_alloc_bytes": float(cuda_mem_alloc),
             "system/cuda_mem_reserved_bytes": float(cuda_mem_reserved),
         }
-        if self.sigreg_var_count:
-            stats.update(
-                {
-                    "sigreg_loss": self.sigreg_loss_sum / self.sigreg_var_count,
-                    "sigreg_proj_var_mean": self.sigreg_var_sum / self.sigreg_var_count,
-                }
-            )
+
+        # Add SIGReg metrics if enabled
+        if sigreg_loss_value is not None:
+            stats["train/sigreg_loss"] = sigreg_loss_value
+            stats["train/sigreg_proj_var_mean"] = sigreg_var_value
+
+        # Log to wandb
         wandb_utils.log(stats, step=self.train_steps)
 
-        self.running_loss = 0
-        self.log_steps = 0
-        self.grad_norm_sum = 0.0
-        self.grad_norm_count = 0
-        self.grad_nonzero_sum = 0
-        self.grad_total_sum = 0
-        # Reset enhanced gradient stats
-        self.grad_max_norm_sum = 0.0
-        self.grad_mean_norm_sum = 0.0
-        self.grad_std_norm_sum = 0.0
-        self.grad_p50_sum = 0.0
-        self.grad_p95_sum = 0.0
-        self.grad_p99_sum = 0.0
-        self.grad_clip_count = 0
-        self.start_time = time()
-        self.sigreg_loss_sum = 0.0
-        self.sigreg_var_sum = 0.0
-        self.sigreg_var_count = 0
+    def print_terminal_metrics(self):
+        """Print summary metrics to terminal at log_every interval."""
+        end_time = time()
+        elapsed = end_time - self.last_log_time
+        steps_per_sec = self.steps_since_last_log / elapsed if elapsed > 0 else 0.0
+
+        logger.info(
+            f"(step={self.train_steps:07d}) Steps/Sec: {steps_per_sec:.2f}"
+        )
+
+        # Reset counters
+        self.last_log_time = time()
+        self.steps_since_last_log = 0
 
     def save_checkpoint(self):
         checkpoint = {
@@ -424,7 +383,34 @@ class Trainer:
 
         sample_args = deepcopy(self.args)
         sample_args.batch_size = self.args.sample_batch_size
-        output_dir = os.path.join(self.sample_dir, f"step_{self.train_steps:07d}")
+
+        # Generate FIXED noise samples (for consistency tracking)
+        logger.info("Generating fixed noise samples...")
+        self._generate_and_log_samples(
+            sample_args,
+            initial_noise=self.fixed_noise,
+            prefix="fixed",
+            subdirectory="fixed"
+        )
+
+        # Generate RANDOM noise samples (for diversity assessment)
+        logger.info("Generating random noise samples...")
+        random_noise = torch.randn_like(self.fixed_noise)
+        self._generate_and_log_samples(
+            sample_args,
+            initial_noise=random_noise,
+            prefix="random",
+            subdirectory="random"
+        )
+
+    def _generate_and_log_samples(self, sample_args, initial_noise, prefix, subdirectory):
+        """Helper method to generate samples and log to wandb with given prefix."""
+        output_dir = os.path.join(
+            self.sample_dir,
+            f"step_{self.train_steps:07d}",
+            subdirectory
+        )
+
         result = sample_pokemon(
             self.ema,
             self.vae,
@@ -432,7 +418,7 @@ class Trainer:
             self.device,
             num_samples=self.args.sample_batch_size,
             output_dir=output_dir,
-            initial_noise=self.fixed_noise,
+            initial_noise=initial_noise,
             return_stats=True,
         )
 
@@ -448,7 +434,7 @@ class Trainer:
                 {
                     "train_step": self.train_steps,
                     "index": idx,
-                    "seed": getattr(self.args, "seed", None),
+                    "seed": getattr(self.args, "seed", None) if prefix == "fixed" else "random",
                     "label": 0,
                     "file_path": file_path,
                     "sampler": getattr(self.args, "sampler", "unknown"),
@@ -456,6 +442,7 @@ class Trainer:
                     if sample_stats
                     else 0,
                     "cfg_scale": getattr(self.args, "cfg_scale", 1.0),
+                    "type": prefix,
                 }
             )
 
@@ -468,31 +455,33 @@ class Trainer:
         ):
             preview_count = min(8, len(samples))
             preview_images = [
-                wandb.Image(samples[i], caption=f"Sample {i}")
+                wandb.Image(samples[i], caption=f"{prefix.capitalize()} {i}")
                 for i in range(preview_count)
             ]
 
-        wandb_utils.log_samples_table(
-            rows, step=self.train_steps, preview_images=preview_images
+        # Log samples table with prefix
+        wandb_utils.log(
+            {f"{prefix}/generated_samples": preview_images} if preview_images else {},
+            step=self.train_steps
         )
 
-        # Sampling diagnostics
+        # Sampling diagnostics with prefix
         if sample_stats:
             diag = {
-                "sampling/mean_steps": sample_stats.get("mean_steps", 0.0),
-                "sampling/median_steps": sample_stats.get("median_steps", 0.0),
-                "sampling/max_steps": sample_stats.get("max_steps", 0),
+                f"{prefix}/sampling/mean_steps": sample_stats.get("mean_steps", 0.0),
+                f"{prefix}/sampling/median_steps": sample_stats.get("median_steps", 0.0),
+                f"{prefix}/sampling/max_steps": sample_stats.get("max_steps", 0),
             }
             trace = sample_stats.get("grad_norm_trace", [])
             if trace:
-                diag["sampling/grad_norm_first"] = trace[0]
-                diag["sampling/grad_norm_last"] = trace[-1]
+                diag[f"{prefix}/sampling/grad_norm_first"] = trace[0]
+                diag[f"{prefix}/sampling/grad_norm_last"] = trace[-1]
             energy = sample_stats.get("energy")
             if energy is not None:
-                diag["energy/mean"] = energy.mean().item()
+                diag[f"{prefix}/energy/mean"] = energy.mean().item()
             wandb_utils.log(diag, step=self.train_steps)
 
-        # Lightweight FID/IS hooks on fixed reference
+        # Lightweight FID/IS hooks on fixed reference with prefix
         sample_tensor = sample_stats.get("samples_tensor") if sample_stats else None
         if (
             sample_tensor is not None
@@ -504,7 +493,7 @@ class Trainer:
             metric_vals = self.metrics.compute(real, fake)
             if metric_vals:
                 wandb_utils.log(
-                    {f"metric/{k}": v for k, v in metric_vals.items()},
+                    {f"{prefix}/metric/{k}": v for k, v in metric_vals.items()},
                     step=self.train_steps,
                 )
 
@@ -512,7 +501,7 @@ class Trainer:
             lpips_vals = self.metrics.compute_lpips_diversity(sample_tensor)
             if lpips_vals:
                 wandb_utils.log(
-                    {f"metric/{k}": v for k, v in lpips_vals.items()},
+                    {f"{prefix}/metric/{k}": v for k, v in lpips_vals.items()},
                     step=self.train_steps,
                 )
 
@@ -561,9 +550,8 @@ class Trainer:
             )
 
     def compute_grad_stats(self):
-        """Enhanced gradient statistics for training health monitoring."""
+        """Industry-standard gradient statistics for training health monitoring."""
         total_norms = []
-        grad_values = []  # Collect all gradient values for percentile computation
         nonzero = 0
         total = 0
         layer_stats = {}  # Per-layer tracking
@@ -574,20 +562,10 @@ class Trainer:
                 param_norm = g.norm(2).item()
                 total_norms.append(param_norm)
 
-                # Sample gradient values for percentile computation (avoid OOM)
-                # Sample up to 10k values per parameter, max 100k total
-                g_flat = g.abs().flatten()
-                if len(g_flat) > 10000:
-                    # Randomly sample 10k values
-                    indices = torch.randperm(len(g_flat), device=g_flat.device)[:10000]
-                    grad_values.append(g_flat[indices])
-                else:
-                    grad_values.append(g_flat)
-
                 nonzero += torch.count_nonzero(g).item()
                 total += g.numel()
 
-                # Per-layer stats for detailed monitoring
+                # Per-layer stats for detailed monitoring (checkpoint time only)
                 layer_stats[name] = {
                     "norm": param_norm,
                     "mean": g.mean().item(),
@@ -601,46 +579,20 @@ class Trainer:
                 "nonzero": 0,
                 "total": 0,
                 "max_norm": 0.0,
-                "mean_norm": 0.0,
-                "std_norm": 0.0,
-                "percentile_50": 0.0,
-                "percentile_95": 0.0,
-                "percentile_99": 0.0,
                 "layer_stats": {},
             }
 
-        # Total gradient norm
+        # Total gradient norm (L2 norm across all parameters)
         total_norm_tensor = torch.stack([torch.tensor(n) for n in total_norms])
         total_norm = torch.norm(total_norm_tensor, 2).item()
 
-        # Max gradient norm (to detect spikes)
+        # Max gradient norm (to detect spikes in individual layers)
         max_norm = max(total_norms)
-
-        # Statistics on per-layer norms
-        mean_norm = total_norm_tensor.mean().item()
-        std_norm = total_norm_tensor.std().item()
-
-        # Percentiles for distribution analysis (on sampled values)
-        all_grad_values = torch.cat(grad_values)
-
-        # Further limit total samples to 100k for percentile computation
-        if len(all_grad_values) > 100000:
-            indices = torch.randperm(len(all_grad_values), device=all_grad_values.device)[:100000]
-            all_grad_values = all_grad_values[indices]
-
-        percentile_50 = torch.quantile(all_grad_values, 0.50).item()
-        percentile_95 = torch.quantile(all_grad_values, 0.95).item()
-        percentile_99 = torch.quantile(all_grad_values, 0.99).item()
 
         return {
             "total_norm": total_norm,
             "nonzero": nonzero,
             "total": total,
             "max_norm": max_norm,
-            "mean_norm": mean_norm,
-            "std_norm": std_norm,
-            "percentile_50": percentile_50,
-            "percentile_95": percentile_95,
-            "percentile_99": percentile_99,
             "layer_stats": layer_stats,
         }
