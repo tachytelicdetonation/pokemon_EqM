@@ -257,10 +257,12 @@ class DifferentialAttention(nn.Module):
             k2 = self._apply_rope(k2)
 
         if self.use_qk_norm:
-            q1 = q1 / (q1.norm(dim=-1, keepdim=True) + 1e-6)
-            q2 = q2 / (q2.norm(dim=-1, keepdim=True) + 1e-6)
-            k1 = k1 / (k1.norm(dim=-1, keepdim=True) + 1e-6)
-            k2 = k2 / (k2.norm(dim=-1, keepdim=True) + 1e-6)
+            # Cast to float32 for norm operations (FP8 not supported by linalg.vector_norm)
+            # torch.compile will fuse these casts for performance
+            q1 = q1 / (q1.float().norm(dim=-1, keepdim=True) + 1e-6)
+            q2 = q2 / (q2.float().norm(dim=-1, keepdim=True) + 1e-6)
+            k1 = k1 / (k1.float().norm(dim=-1, keepdim=True) + 1e-6)
+            k2 = k2 / (k2.float().norm(dim=-1, keepdim=True) + 1e-6)
 
         attn_mask = self._get_window_mask(N, x.device, x.dtype)
 
