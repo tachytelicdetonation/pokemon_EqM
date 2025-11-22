@@ -43,7 +43,7 @@ def get_args():
         "vae_channels": 16,
         "cfg_scale": 1.5,
         "cfg_scale_cap": 1.5,
-        "uncond": False,
+        "uncond": True,  # Match official EqM: disables time conditioning (zeros out timesteps)
         "energy_head": "implicit",
         "path_type": "Linear",
         "prediction": "velocity",
