@@ -19,15 +19,8 @@ def update_ema(ema_model, model, decay=0.9999):
     ema_params = OrderedDict(ema_model.named_parameters())
     model_params = OrderedDict(model.named_parameters())
 
-    total_change = 0.0
     for name, param in model_params.items():
-        # Calculate change before update for debugging
-        old_ema = ema_params[name].data.clone()
         ema_params[name].data.mul_(decay).add_(param.data, alpha=1 - decay)
-        change = (ema_params[name].data - old_ema).abs().mean().item()
-        total_change += change
-
-    return total_change
 
 class Trainer:
     def __init__(self, model, ema, opt, transport, vae, loader, lr_scheduler, device, args):
@@ -187,11 +180,7 @@ class Trainer:
                 self.opt.step()
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
-                ema_change = update_ema(self.ema, self.model, decay=self.ema_decay)
-
-                # Debug: Log EMA change every 10 steps
-                if self.train_steps % 10 == 0:
-                    logger.info(f"EMA parameter change at step {self.train_steps}: {ema_change:.6f}")
+                update_ema(self.ema, self.model, decay=self.ema_decay)
 
                 self.running_loss += loss.item()
                 self.log_steps += 1
@@ -262,11 +251,6 @@ class Trainer:
 
     def generate_samples(self):
         logger.info(f"Generating samples at step {self.train_steps}...")
-
-        # Debug: Check EMA model weights
-        first_param = next(self.ema.parameters())
-        logger.info(f"EMA first param mean: {first_param.data.mean().item():.6f}, std: {first_param.data.std().item():.6f}")
-
         sample_args = deepcopy(self.args)
         sample_args.batch_size = self.args.sample_batch_size
         output_dir = os.path.join(self.sample_dir, f"step_{self.train_steps:07d}")
