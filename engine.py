@@ -574,8 +574,15 @@ class Trainer:
                 param_norm = g.norm(2).item()
                 total_norms.append(param_norm)
 
-                # Collect gradient values for percentile computation
-                grad_values.append(g.abs().flatten())
+                # Sample gradient values for percentile computation (avoid OOM)
+                # Sample up to 10k values per parameter, max 100k total
+                g_flat = g.abs().flatten()
+                if len(g_flat) > 10000:
+                    # Randomly sample 10k values
+                    indices = torch.randperm(len(g_flat), device=g_flat.device)[:10000]
+                    grad_values.append(g_flat[indices])
+                else:
+                    grad_values.append(g_flat)
 
                 nonzero += torch.count_nonzero(g).item()
                 total += g.numel()
@@ -613,8 +620,14 @@ class Trainer:
         mean_norm = total_norm_tensor.mean().item()
         std_norm = total_norm_tensor.std().item()
 
-        # Percentiles for distribution analysis
+        # Percentiles for distribution analysis (on sampled values)
         all_grad_values = torch.cat(grad_values)
+
+        # Further limit total samples to 100k for percentile computation
+        if len(all_grad_values) > 100000:
+            indices = torch.randperm(len(all_grad_values), device=all_grad_values.device)[:100000]
+            all_grad_values = all_grad_values[indices]
+
         percentile_50 = torch.quantile(all_grad_values, 0.50).item()
         percentile_95 = torch.quantile(all_grad_values, 0.95).item()
         percentile_99 = torch.quantile(all_grad_values, 0.99).item()
