@@ -8,4 +8,6 @@ wandb
 schedulefree
 torchmetrics[image]
 lpips
-torchao
+# torchao nightly for FP8 training (PyTorch 2.9+ compatibility)
+# Install with: pip install --upgrade --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128
+# Or for stable: pip install torchao
