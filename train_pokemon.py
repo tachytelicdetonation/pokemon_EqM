@@ -39,6 +39,12 @@ def requires_grad(model, flag=True):
 def main():
     args = get_args()
     
+    def log_memory(stage):
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"[Memory] {stage}: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+
     # Setup device
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -72,6 +78,7 @@ def main():
         rope_base=getattr(args, 'rope_base', 10000),
         use_liere=getattr(args, 'use_liere', False)
     ).to(device)
+    log_memory("After model creation")
 
     # Apply FP8 conversion before compilation (if enabled)
     use_torchao_fp8 = False
@@ -101,6 +108,7 @@ def main():
         compile_mode = getattr(args, 'compile_mode', 'default')
         model = torch.compile(model, mode=compile_mode)
         logger.info("Model compilation complete")
+    log_memory("After model compilation")
 
     ema = deepcopy(model).to(device)
     requires_grad(ema, False)
@@ -121,6 +129,7 @@ def main():
     # VAE
     vae = load_vae(args.vae_path, args.vae, device)
     requires_grad(vae, False)
+    log_memory("After VAE loading")
 
     # Data
     if getattr(args, 'cache_latents', False):
@@ -197,6 +206,7 @@ def main():
     # Trainer
     trainer = Trainer(model, ema, opt, transport, vae, loader, lr_scheduler, device, args,
                      scaler=scaler, amp_dtype=amp_dtype)
+    log_memory("Before training loop")
     
     # Resume logic
     start_epoch = 0
