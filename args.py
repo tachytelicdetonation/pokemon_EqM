@@ -78,6 +78,12 @@ def get_args():
         "compile": True,  # Enable torch.compile for faster execution
         "compile_mode": "max-autotune",  # Options: "default", "reduce-overhead", "max-autotune"
         "cache_latents": True,  # Cache VAE-encoded latents (requires preprocessing)
+        # Positional Encodings: RoPE or LieRE (cannot use both simultaneously)
+        "use_rope": False,  # Enable 2D Axial RoPE (fixed rotations for H and W dimensions)
+        "rope_base": 10000,  # Base frequency for RoPE (higher = better long-range modeling)
+        "use_liere": True,  # Enable LieRE (learnable rotation matrices via Lie algebra)
+                           # LieRE is now the default - it learns optimal positional encodings
+                           # Reference: https://arxiv.org/abs/2406.10322 (ICML 2025)
     }
 
     # Load config from JSON

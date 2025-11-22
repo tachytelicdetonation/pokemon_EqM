@@ -29,6 +29,9 @@ class EqM(nn.Module):
         head_drop=0.0,
         window_size=None,
         use_abs_pos_emb=False,
+        use_rope=True,
+        rope_base=10000,
+        use_liere=False,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -54,6 +57,9 @@ class EqM(nn.Module):
             use_qk_norm=use_qk_norm,
             head_drop=head_drop,
             window_size=window_size,
+            use_rope=use_rope,
+            rope_base=rope_base,
+            use_liere=use_liere,
         )
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs) for _ in range(depth)

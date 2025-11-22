@@ -259,16 +259,8 @@ class Trainer:
                 else:
                     loss.backward()
 
-                # Only compute expensive stats and log if it's a logging step
-                is_log_step = (self.train_steps % self.args.log_every == 0)
-                
-                grad_stats = None
-                was_clipped = False
-                
-                if is_log_step:
-                    # Compute gradient statistics before clipping
-                    grad_stats = self.compute_grad_stats()
-                    self.last_grad_stats = grad_stats  # Store for per-layer logging
+                # Compute gradient statistics every step for wandb logging
+                grad_stats = self.compute_grad_stats()
 
                 # SIGReg loss tracking
                 sigreg_loss_value = None
@@ -281,22 +273,18 @@ class Trainer:
 
                 # Gradient clipping (common for diffusion models: 0.1-1.0)
                 clip_value = getattr(self.args, "grad_clip", 1.0)
-                
+                unclipped_norm = None
+                was_clipped = False
+
                 if clip_value > 0:
-                    # If we didn't compute stats yet but need to clip, we might need to compute norm
-                    # But clip_grad_norm_ computes it anyway.
                     if self.scaler is not None:
                         self.scaler.unscale_(self.opt)
-                    
-                    # We can capture the norm from clip_grad_norm_
+
+                    # Capture the norm from clip_grad_norm_
                     unclipped_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip_value)
-                    
-                    if is_log_step and grad_stats is not None:
-                         # Update total_norm with the one computed by clip_grad_norm_ if we want exact consistency
-                         # or just rely on our pre-computed one. 
-                         # Actually, clip_grad_norm_ returns the norm BEFORE clipping.
-                         if unclipped_norm > clip_value:
-                             was_clipped = True
+
+                    if unclipped_norm > clip_value:
+                        was_clipped = True
 
                 # Optimizer step with mixed precision support
                 if self.scaler is not None:
@@ -311,10 +299,14 @@ class Trainer:
                 self.train_steps += 1
                 self.steps_since_last_log += 1
 
-                # Log metrics to wandb only on log steps
+                # ALWAYS log metrics to wandb every step (mandatory)
+                self.log_step_metrics(loss.item(), grad_stats, sigreg_loss_value, sigreg_var_value, was_clipped, unclipped_norm)
+
+                # Terminal output only at log_every interval
+                is_log_step = (self.train_steps % self.args.log_every == 0)
                 if is_log_step:
-                    self.log_step_metrics(loss.item(), grad_stats, sigreg_loss_value, sigreg_var_value, was_clipped)
                     self.print_terminal_metrics()
+                    self.last_grad_stats = grad_stats  # Store for per-layer logging
 
                 if (
                     self.train_steps % self.args.ckpt_every == 0
@@ -323,8 +315,8 @@ class Trainer:
                     self.save_checkpoint()
                     self.generate_samples()
 
-    def log_step_metrics(self, loss_value, grad_stats, sigreg_loss_value, sigreg_var_value, was_clipped):
-        """Log metrics to wandb immediately after each training step."""
+    def log_step_metrics(self, loss_value, grad_stats, sigreg_loss_value, sigreg_var_value, was_clipped, unclipped_norm=None):
+        """Log metrics to wandb immediately after each training step (mandatory every step)."""
         # Get current learning rate
         if self.lr_scheduler is not None:
             current_lr = self.lr_scheduler.get_last_lr()[0]
@@ -350,7 +342,7 @@ class Trainer:
             else 0
         )
 
-        # Build metrics dict with industry-standard gradient health metrics only
+        # Build metrics dict with industry-standard gradient health metrics
         stats = {
             "train/loss": loss_value,
             "train/learning_rate": current_lr,
@@ -360,6 +352,11 @@ class Trainer:
             "grad/max_norm": grad_stats["max_norm"],
             "grad/fraction_nonzero": frac_nonzero,
             "grad/was_clipped": 1.0 if was_clipped else 0.0,
+            # OpenAI's Gradient Signal-to-Noise Ratio (MANDATORY)
+            # Monitors training phase & stability
+            "grad/gsnr": grad_stats["gsnr"],
+            "grad/mean": grad_stats["grad_mean"],
+            "grad/variance": grad_stats["grad_var"],
             # System metrics
             "system/cuda_mem_alloc_bytes": float(cuda_mem_alloc),
             "system/cuda_mem_reserved_bytes": float(cuda_mem_reserved),
@@ -574,11 +571,20 @@ class Trainer:
             )
 
     def compute_grad_stats(self):
-        """Industry-standard gradient statistics for training health monitoring."""
+        """Industry-standard gradient statistics for training health monitoring.
+
+        Includes OpenAI's Gradient Signal-to-Noise Ratio (GSNR) metric for:
+        - Training phase detection (obvious vs intricate features)
+        - Batch size optimization
+        - Training stability monitoring
+        """
         total_norms = []
         nonzero = 0
         total = 0
         layer_stats = {}  # Per-layer tracking
+
+        # For GSNR calculation: collect all gradient values
+        all_grad_values = []
 
         for name, p in self.model.named_parameters():
             if p.grad is not None:
@@ -588,6 +594,9 @@ class Trainer:
 
                 nonzero += torch.count_nonzero(g).item()
                 total += g.numel()
+
+                # Collect gradient values for GSNR (flatten to 1D)
+                all_grad_values.append(g.flatten())
 
                 # Per-layer stats for detailed monitoring (checkpoint time only)
                 layer_stats[name] = {
@@ -603,6 +612,9 @@ class Trainer:
                 "nonzero": 0,
                 "total": 0,
                 "max_norm": 0.0,
+                "gsnr": 0.0,
+                "grad_mean": 0.0,
+                "grad_var": 0.0,
                 "layer_stats": {},
             }
 
@@ -613,10 +625,24 @@ class Trainer:
         # Max gradient norm (to detect spikes in individual layers)
         max_norm = max(total_norms)
 
+        # Gradient Signal-to-Noise Ratio (GSNR) - OpenAI's metric
+        # GSNR = ||E[gradients]||² / Var(gradients)
+        # High GSNR = strong signal, low GSNR = noisy gradients
+        all_grads = torch.cat(all_grad_values)
+        grad_mean = all_grads.mean().item()
+        grad_var = all_grads.var().item()
+
+        # Compute GSNR with epsilon to prevent division by zero
+        epsilon = 1e-10
+        gsnr = (grad_mean ** 2) / (grad_var + epsilon)
+
         return {
             "total_norm": total_norm,
             "nonzero": nonzero,
             "total": total,
             "max_norm": max_norm,
+            "gsnr": gsnr,
+            "grad_mean": grad_mean,
+            "grad_var": grad_var,
             "layer_stats": layer_stats,
         }

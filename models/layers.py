@@ -101,6 +101,146 @@ class SwiGLU(nn.Module):
         x = self.drop(x)
         return x
 
+class LieRE(nn.Module):
+    """
+    Lie Rotational Positional Encodings (LieRE) - learnable generalization of RoPE.
+    Uses Lie group theory to create rotation matrices via matrix exponentials of
+    skew-symmetric matrices (Lie algebra elements).
+
+    Reference: https://arxiv.org/abs/2406.10322
+    """
+    def __init__(self, num_dim, dim):
+        """
+        Args:
+            num_dim: Number of spatial dimensions (2 for images: H, W)
+            dim: Head dimension
+        """
+        super().__init__()
+        self.num_dim = num_dim
+        self.dim = dim
+
+        # Learnable generator parameters (Lie algebra)
+        # Initialize with small random values
+        self.generator_params = nn.Parameter(
+            torch.randn(num_dim, dim, dim) * 0.02
+        )
+
+    def _make_skew_symmetric(self, matrices):
+        """
+        Convert arbitrary matrices to skew-symmetric matrices (A^T = -A).
+        This ensures the matrix exponential produces valid rotation matrices.
+
+        Args:
+            matrices: Tensor of shape [..., dim, dim]
+
+        Returns:
+            Skew-symmetric matrices of same shape
+        """
+        # Extract upper triangular part (excluding diagonal)
+        upper_tri = torch.triu(matrices, diagonal=1)
+        # Create skew-symmetric: A - A^T
+        skew = upper_tri - upper_tri.transpose(-2, -1)
+        return skew
+
+    def _get_rotations(self, dimensions, device, dtype):
+        """
+        Generate rotation matrices for given spatial dimensions.
+
+        Note: Caching is disabled for LieRE since the generator_params are learnable
+        and change during training. Gradients must flow through this computation.
+
+        Args:
+            dimensions: Tuple of spatial dimensions (H, W) for 2D
+            device: Target device
+            dtype: Target dtype
+
+        Returns:
+            Rotation matrices of shape [num_positions, dim, dim]
+        """
+        # Create skew-symmetric matrices from generator parameters
+        skew_matrices = self._make_skew_symmetric(self.generator_params)  # [num_dim, dim, dim]
+
+        # Compute rotation matrices via matrix exponential (Lie group elements)
+        # matrix_exp maps from Lie algebra (skew-symmetric) to Lie group (rotations)
+        rotations = torch.matrix_exp(skew_matrices.float())  # [num_dim, dim, dim]
+        rotations = rotations.to(dtype)
+
+        # Generate position encodings for each dimension
+        # For 2D: dimensions = (H, W)
+        all_positions = []
+        for dim_idx, dim_size in enumerate(dimensions):
+            positions = torch.arange(dim_size, device=device, dtype=torch.float32)
+            all_positions.append(positions)
+
+        # Create meshgrid for 2D positions
+        if self.num_dim == 2:
+            pos_h, pos_w = torch.meshgrid(all_positions[0], all_positions[1], indexing='ij')
+            pos_h = pos_h.reshape(-1)  # [H*W]
+            pos_w = pos_w.reshape(-1)  # [H*W]
+            positions_list = [pos_h, pos_w]
+        else:
+            # Fallback for other dimensions
+            positions_list = all_positions
+
+        # Compute cumulative rotations for each position
+        num_positions = len(positions_list[0])
+
+        # Build list of rotation matrices (avoid inplace operations for autograd)
+        rotation_list = []
+        for pos_idx in range(num_positions):
+            # Start with identity
+            R_cumulative = torch.eye(self.dim, device=device, dtype=dtype)
+
+            # Apply rotation for each dimension
+            for dim_idx in range(self.num_dim):
+                p = positions_list[dim_idx][pos_idx].item()
+                if p != 0:
+                    # R^p = exp(p * log(R)) = exp(p * skew_matrix)
+                    scaled_skew = skew_matrices[dim_idx] * p
+                    R_pow = torch.matrix_exp(scaled_skew.float()).to(dtype)
+                    R_cumulative = R_cumulative @ R_pow
+
+            rotation_list.append(R_cumulative)
+
+        # Stack into a single tensor
+        rotation_matrices = torch.stack(rotation_list, dim=0)  # [num_positions, dim, dim]
+
+        return rotation_matrices
+
+    def apply_rotations(self, x, dimensions):
+        """
+        Apply LieRE to query or key tensor.
+
+        Args:
+            x: Input tensor of shape [B, num_heads, seq_len, head_dim]
+            dimensions: Tuple of spatial dimensions (H, W) for 2D
+
+        Returns:
+            Tensor with LieRE applied, same shape as input
+        """
+        B, num_heads, seq_len, head_dim = x.shape
+
+        # Get rotation matrices for these dimensions
+        rotations = self._get_rotations(dimensions, x.device, x.dtype)  # [seq_len, head_dim, head_dim]
+
+        # Apply rotation: x @ R^T for each position
+        # x: [B, num_heads, seq_len, head_dim]
+        # rotations: [seq_len, head_dim, head_dim]
+
+        # Reshape for batched matrix multiplication
+        x_flat = x.reshape(B * num_heads, seq_len, head_dim)  # [B*num_heads, seq_len, head_dim]
+
+        # Apply rotations: [B*num_heads, seq_len, head_dim] @ [seq_len, head_dim, head_dim]
+        # We need to apply different rotation to each position
+        output = torch.zeros_like(x_flat)
+        for i in range(seq_len):
+            output[:, i, :] = x_flat[:, i, :] @ rotations[i].T
+
+        # Reshape back
+        output = output.reshape(B, num_heads, seq_len, head_dim)
+        return output
+
+
 class DifferentialAttention(nn.Module):
     def __init__(
         self,
@@ -113,10 +253,14 @@ class DifferentialAttention(nn.Module):
         use_qk_norm=True,
         head_drop=0.0,
         window_size=None,
+        use_rope=True,
+        rope_base=10000,
+        use_liere=False,
     ):
         """
         Differential (two-branch) attention with QK normalization,
-        grouped/shared KV heads, head drop regularization, and safer lambda init.
+        grouped/shared KV heads, head drop regularization, safer lambda init,
+        and positional encodings (2D Axial RoPE or LieRE).
         """
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
@@ -128,6 +272,21 @@ class DifferentialAttention(nn.Module):
         self.use_qk_norm = use_qk_norm
         self.head_drop = head_drop
         self.window_size = window_size
+        self.use_rope = use_rope
+        self.rope_base = rope_base
+        self.use_liere = use_liere
+
+        # Can't use both RoPE and LieRE simultaneously
+        if self.use_rope and self.use_liere:
+            raise ValueError("Cannot use both RoPE and LieRE. Set use_liere=True and use_rope=False for LieRE.")
+
+        # RoPE requires even head dimension (split in half for H and W)
+        if self.use_rope:
+            assert self.head_dim % 2 == 0, f'head_dim must be even for RoPE, got {self.head_dim}'
+
+        # Initialize LieRE if requested
+        if self.use_liere:
+            self.liere = LieRE(num_dim=2, dim=self.head_dim)  # 2D for images (H, W)
 
         # Separate V projections to avoid capacity loss after subtraction.
         self.q_proj = nn.Linear(dim, 2 * dim, bias=qkv_bias)
@@ -143,6 +302,7 @@ class DifferentialAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
 
         self._mask_cache = {}
+        self._rope_cache = {}  # Cache for RoPE embeddings
 
     def _get_window_mask(self, seq_len, device, dtype):
         if self.window_size is None:
@@ -168,6 +328,96 @@ class DifferentialAttention(nn.Module):
         mask = mask.masked_fill(mask == 1, float('-inf'))
         self._mask_cache[key] = mask
         return mask
+
+    @staticmethod
+    def _rotate_half(x):
+        """
+        Rotates half the hidden dims of the input for RoPE application.
+        Used to implement complex multiplication in the rotary embedding.
+        """
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat([-x2, x1], dim=-1)
+
+    def _get_rope(self, seq_len, device, dtype):
+        """
+        Generate 2D Axial RoPE (Rotary Position Embeddings) for a square grid.
+        Splits head_dim in half: first half for height, second half for width.
+
+        Args:
+            seq_len: Number of patches (assumes square grid: seq_len = H * W)
+            device: Target device for the embeddings
+            dtype: Target dtype for the embeddings
+
+        Returns:
+            cos, sin: Cosine and sine embeddings of shape [1, 1, seq_len, head_dim]
+        """
+        # Check cache first
+        key = (seq_len, device, dtype)
+        if key in self._rope_cache:
+            return self._rope_cache[key]
+
+        # Compute grid size (assume square)
+        side = int(seq_len ** 0.5)
+        if side * side != seq_len:
+            # Fallback to 1D for non-square sequences
+            dim_half = self.head_dim // 2
+            inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, dim_half, 2, device=device, dtype=torch.float32) / dim_half))
+            pos = torch.arange(seq_len, device=device, dtype=torch.float32)
+            theta = torch.outer(pos, inv_freq)
+            theta = theta.repeat(1, 2)  # [seq_len, dim_half]
+            # Pad to full head_dim
+            theta = torch.cat([theta, theta], dim=1)  # [seq_len, head_dim]
+        else:
+            # 2D axial RoPE
+            dim_half = self.head_dim // 2
+            dim_quarter = dim_half // 2
+
+            # Inverse frequencies for RoPE
+            inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, dim_quarter, 1, device=device, dtype=torch.float32) / dim_quarter))
+
+            # Create 2D position grid
+            pos_h = torch.arange(side, device=device, dtype=torch.float32)
+            pos_w = torch.arange(side, device=device, dtype=torch.float32)
+            grid_h, grid_w = torch.meshgrid(pos_h, pos_w, indexing='ij')
+            pos_h = grid_h.reshape(-1)  # [seq_len]
+            pos_w = grid_w.reshape(-1)  # [seq_len]
+
+            # Compute theta for height and width separately
+            theta_h = torch.outer(pos_h, inv_freq)  # [seq_len, dim_quarter]
+            theta_w = torch.outer(pos_w, inv_freq)  # [seq_len, dim_quarter]
+
+            # Concatenate: first half for height, second half for width
+            theta = torch.cat([theta_h, theta_w], dim=1)  # [seq_len, dim_half]
+            # Duplicate to cover full head_dim (apply same rotation to both halves)
+            theta = torch.cat([theta, theta], dim=1)  # [seq_len, head_dim]
+
+        # Compute cos and sin
+        cos = theta.cos().to(dtype)  # [seq_len, head_dim]
+        sin = theta.sin().to(dtype)  # [seq_len, head_dim]
+
+        # Reshape to [1, 1, seq_len, head_dim] for broadcasting
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+
+        # Cache the result - clone to avoid reference issues with torch.compile
+        self._rope_cache[key] = (cos.clone(), sin.clone())
+        return cos, sin
+
+    def _apply_rope(self, x):
+        """
+        Apply 2D Axial RoPE to query or key tensor.
+
+        Args:
+            x: Input tensor of shape [B, num_heads, seq_len, head_dim]
+
+        Returns:
+            Tensor with RoPE applied, same shape as input
+        """
+        _, _, seq_len, _ = x.shape
+        cos, sin = self._get_rope(seq_len, x.device, x.dtype)
+
+        # Apply rotary embedding: x * cos + rotate_half(x) * sin
+        return x * cos + self._rotate_half(x) * sin
 
     def forward(self, x):
         B, N, C = x.shape
@@ -200,6 +450,23 @@ class DifferentialAttention(nn.Module):
             k2 = k2.repeat_interleave(repeat, dim=1)
             v1 = v1.repeat_interleave(repeat, dim=1)
             v2 = v2.repeat_interleave(repeat, dim=1)
+
+        # Apply positional encoding to Q and K (before QK normalization)
+        if self.use_rope:
+            # Apply 2D Axial RoPE (fixed rotations)
+            q1 = self._apply_rope(q1)
+            q2 = self._apply_rope(q2)
+            k1 = self._apply_rope(k1)
+            k2 = self._apply_rope(k2)
+        elif self.use_liere:
+            # Apply LieRE (learnable rotations)
+            # Compute spatial dimensions from sequence length
+            side = int(N ** 0.5)
+            dimensions = (side, side)  # (H, W)
+            q1 = self.liere.apply_rotations(q1, dimensions)
+            q2 = self.liere.apply_rotations(q2, dimensions)
+            k1 = self.liere.apply_rotations(k1, dimensions)
+            k2 = self.liere.apply_rotations(k2, dimensions)
 
         if self.use_qk_norm:
             # Cast to float32 for norm operations (FP8 not supported by linalg.vector_norm)

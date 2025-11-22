@@ -62,7 +62,10 @@ def main():
         num_classes=args.num_classes,
         in_channels=args.vae_channels,
         uncond=args.uncond,
-        energy_head=args.energy_head
+        energy_head=args.energy_head,
+        use_rope=getattr(args, 'use_rope', True),
+        rope_base=getattr(args, 'rope_base', 10000),
+        use_liere=getattr(args, 'use_liere', False)
     ).to(device)
 
     # Apply FP8 conversion before compilation (if enabled)
