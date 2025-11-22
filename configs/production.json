@@ -10,5 +10,7 @@
   "compile": true,
   "compile_mode": "max-autotune",
   "grad_clip": 1.0,
-  "cache_latents": true
+  "cache_latents": true,
+  "stepsize": 0.0017,
+  "cfg_scale": 4.0
 }
