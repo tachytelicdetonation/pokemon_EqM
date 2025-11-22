@@ -194,9 +194,10 @@ class LieRE(nn.Module):
         numerator = I + A
         denominator = I - A
         
-        rotation_matrices = torch.linalg.inv(denominator) @ numerator
+        # Cast to float32 for inversion as linalg.inv doesn't support bfloat16
+        rotation_matrices = torch.linalg.inv(denominator.float()) @ numerator.float()
 
-        return rotation_matrices  # [num_positions, dim, dim]
+        return rotation_matrices.to(dtype=dtype)  # [num_positions, dim, dim]
 
     def apply_rotations(self, x, dimensions):
         """
