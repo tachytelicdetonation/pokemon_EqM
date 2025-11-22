@@ -79,9 +79,9 @@ def get_args():
         "compile_mode": "max-autotune",  # Options: "default", "reduce-overhead", "max-autotune"
         "cache_latents": True,  # Cache VAE-encoded latents (requires preprocessing)
         # Positional Encodings: RoPE or LieRE (cannot use both simultaneously)
-        "use_rope": False,  # Enable 2D Axial RoPE (fixed rotations for H and W dimensions)
+        "use_rope": True,  # Enable 2D Axial RoPE (fixed rotations for H and W dimensions)
         "rope_base": 10000,  # Base frequency for RoPE (higher = better long-range modeling)
-        "use_liere": True,  # Enable LieRE (learnable rotation matrices via Lie algebra)
+        "use_liere": False,  # Enable LieRE (learnable rotation matrices via Lie algebra) - DISABLED: has severe performance bug (44s/step)
                            # LieRE is now the default - it learns optimal positional encodings
                            # Reference: https://arxiv.org/abs/2406.10322 (ICML 2025)
     }

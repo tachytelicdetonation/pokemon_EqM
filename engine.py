@@ -200,9 +200,10 @@ class Trainer:
 
         logger.info(f"Training for {self.args.epochs} epochs...")
 
-        # Initial samples
-        if self.train_steps == 0:
-            self.generate_samples()
+        # Skip initial sampling at step 0 (untrained model outputs zeros)
+        # First samples will be generated at first checkpoint (step 1000)
+        # if self.train_steps == 0:
+        #     self.generate_samples()
 
         for epoch in range(start_epoch, self.args.epochs):
             logger.info(f"Beginning epoch {epoch}...")
