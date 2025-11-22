@@ -15,6 +15,9 @@ def get_args():
     parser.add_argument("--batch_size", type=int, help="Override batch size")
     parser.add_argument("--log_every", type=int, help="Override log frequency")
     parser.add_argument("--cache_latents", action="store_true", help="Enable latent caching")
+    parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
+    parser.add_argument("--compile-mode", type=str, help="Override compile mode")
+    parser.add_argument("--mixed-precision", type=str, help="Override mixed precision (fp8, bf16, fp16, no)")
     
     args = parser.parse_args()
 
@@ -76,7 +79,7 @@ def get_args():
         # Training optimizations (H100/H200 optimized defaults)
         "mixed_precision": "fp8",  # Options: "fp8", "bf16", "fp16", or False/None for fp32
         "compile": True,  # Enable torch.compile for faster execution
-        "compile_mode": "max-autotune",  # Options: "default", "reduce-overhead", "max-autotune"
+        "compile_mode": "default",  # Options: "default", "reduce-overhead", "max-autotune" (max-autotune causes extreme slowness with NGD sampler)
         "cache_latents": True,  # Cache VAE-encoded latents (requires preprocessing)
         # Positional Encodings: RoPE or LieRE (cannot use both simultaneously)
         "use_rope": False,  # Enable 2D Axial RoPE (fixed rotations for H and W dimensions)
@@ -123,6 +126,14 @@ def get_args():
         config['log_every'] = args.log_every
     if args.cache_latents:
         config['cache_latents'] = True
+    
+    # Debugging overrides
+    if args.no_compile:
+        config['compile'] = False
+    if args.compile_mode:
+        config['compile_mode'] = args.compile_mode
+    if args.mixed_precision:
+        config['mixed_precision'] = args.mixed_precision if args.mixed_precision != 'no' else None
     # Default to stochastic behavior if seed is absent in config
     if 'seed' not in config:
         config['seed'] = None
