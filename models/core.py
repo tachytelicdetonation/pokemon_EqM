@@ -32,6 +32,11 @@ class EqM(nn.Module):
         use_rope=True,
         rope_base=10000,
         use_liere=False,
+        liere_jitter_std=0.0,
+        liere_jitter_mode='gaussian',
+        liere_pos_embed_shift=None,
+        liere_pos_embed_jitter=None,
+        liere_pos_embed_rescale=2.0,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -60,6 +65,11 @@ class EqM(nn.Module):
             use_rope=use_rope,
             rope_base=rope_base,
             use_liere=use_liere,
+            liere_jitter_std=liere_jitter_std,
+            liere_jitter_mode=liere_jitter_mode,
+            liere_pos_embed_shift=liere_pos_embed_shift,
+            liere_pos_embed_jitter=liere_pos_embed_jitter,
+            liere_pos_embed_rescale=liere_pos_embed_rescale,
         )
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs) for _ in range(depth)

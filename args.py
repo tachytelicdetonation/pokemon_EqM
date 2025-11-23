@@ -81,12 +81,23 @@ def get_args():
         "compile": True,  # Enable torch.compile for faster execution
         "compile_mode": "default",  # Options: "default", "reduce-overhead", "max-autotune" (max-autotune causes extreme slowness with NGD sampler)
         "cache_latents": True,  # Cache VAE-encoded latents (requires preprocessing)
+        "augment_latents": True,  # Enable flip augmentation on latents (safe, keeps targets clean)
+        "mask_augment": False,  # Enable masking on CORRUPTED samples (not targets) for robustness. Experimental!
+        "mask_prob": 0.5,  # Probability of applying mask when mask_augment=True
         # Positional Encodings: RoPE or LieRE (cannot use both simultaneously)
         "use_rope": False,  # Enable 2D Axial RoPE (fixed rotations for H and W dimensions)
         "rope_base": 10000,  # Base frequency for RoPE (higher = better long-range modeling)
         "use_liere": True,  # Enable LieRE (learnable rotation matrices via Lie algebra) - Optimized with Cayley transform
                            # LieRE is now the default - it learns optimal positional encodings
                            # Reference: https://arxiv.org/abs/2406.10322 (ICML 2025)
+        "liere_jitter_std": 0.1,  # Coordinate jittering for LieRE during training (Gaussian mode only)
+                                   # Only used when liere_jitter_mode='gaussian'
+                                   # 0.0 = disabled, 0.05-0.2 = typical range
+        "liere_jitter_mode": "dinov3",  # Jittering mode: 'gaussian' (simple) or 'dinov3' (DINOv3-style, DEFAULT)
+        # DINOv3-style jittering parameters (DEFAULT MODE - Meta AI's approach for resolution invariance)
+        "liere_pos_embed_shift": 0.1,     # Uniform shift in [-shift, shift]. Adds translation invariance
+        "liere_pos_embed_jitter": 1.5,    # Log-uniform jitter in [1/jitter, jitter]. Per-dimension scaling [0.67, 1.5]
+        "liere_pos_embed_rescale": 2.0,   # Global rescale in [1/rescale, rescale]. Uniform scaling [0.5, 2.0]
         # Model-Guidance (MG) settings - arXiv:2502.12154
         "use_mg": True,  # Enable Model-Guidance training (energy-guided targets) - DEFAULT ON
         "mg_lambda": 0.1,  # Guidance strength (0.0 = no guidance, higher = stronger)

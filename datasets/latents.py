@@ -78,15 +78,16 @@ class LatentDataset(Dataset):
 
     def __getitem__(self, idx):
         if self.load_to_memory:
-            latent = self.latents[idx]
+            latent = self.latents[idx].clone()  # Clone to avoid modifying cached version
         else:
             latent = torch.load(self.latent_paths[idx])
-            
-        # Apply augmentations only if enabled
+
+        # Apply ONLY flip augmentation (keep data clean for proper EqM target)
+        # Masking is now handled in transport layer to corrupt inputs (not targets)
         if self.augment:
             latent = self.flip(latent)
-            latent = self.masking(latent)
-            
+            # Note: masking removed - now applied to noisy samples in transport
+
         # Return label 0 for all images
         label = 0
         return latent, label

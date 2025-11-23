@@ -12,5 +12,12 @@
   "vae_path": "qwen_image_vae.safetensors",
   "data_path": "data/raw",
   "mixed_precision": false,
-  "compile": false
+  "compile": false,
+  "augment_latents": true,
+  "mask_augment": false,
+  "use_liere": true,
+  "liere_jitter_mode": "dinov3",
+  "liere_pos_embed_shift": 0.05,
+  "liere_pos_embed_jitter": 1.2,
+  "liere_pos_embed_rescale": 1.5
 }

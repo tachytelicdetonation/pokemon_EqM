@@ -76,7 +76,12 @@ def main():
         energy_head=args.energy_head,
         use_rope=getattr(args, 'use_rope', True),
         rope_base=getattr(args, 'rope_base', 10000),
-        use_liere=getattr(args, 'use_liere', False)
+        use_liere=getattr(args, 'use_liere', False),
+        liere_jitter_std=getattr(args, 'liere_jitter_std', 0.0),
+        liere_jitter_mode=getattr(args, 'liere_jitter_mode', 'gaussian'),
+        liere_pos_embed_shift=getattr(args, 'liere_pos_embed_shift', None),
+        liere_pos_embed_jitter=getattr(args, 'liere_pos_embed_jitter', None),
+        liere_pos_embed_rescale=getattr(args, 'liere_pos_embed_rescale', 2.0)
     ).to(device)
     log_memory("After model creation")
 
@@ -127,6 +132,8 @@ def main():
         use_mg=getattr(args, 'use_mg', False),
         mg_lambda=getattr(args, 'mg_lambda', 0.1),
         mg_energy_head=getattr(args, 'mg_energy_head', 'dot'),
+        mask_augment=getattr(args, 'mask_augment', False),
+        mask_prob=getattr(args, 'mask_prob', 0.5),
     )
 
     # VAE
@@ -151,8 +158,9 @@ def main():
                             "--image_size", str(args.image_size),
                             "--vae_path", args.vae_path], check=True)
             
-        dataset = LatentDataset(latent_dir, load_to_memory=True)
-        logger.info(f"Using cached latents from {latent_dir}")
+        augment = getattr(args, 'augment_latents', False)
+        dataset = LatentDataset(latent_dir, load_to_memory=True, augment=augment)
+        logger.info(f"Using cached latents from {latent_dir} (augmentation {'enabled' if augment else 'disabled'})")
     else:
         transform = transforms.Compose([
             transforms.Resize((args.image_size, args.image_size)),

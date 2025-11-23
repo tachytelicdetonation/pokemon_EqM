@@ -109,15 +109,28 @@ class LieRE(nn.Module):
 
     Reference: https://arxiv.org/abs/2406.10322
     """
-    def __init__(self, num_dim, dim):
+    def __init__(self, num_dim, dim, jitter_std=0.0, jitter_mode='gaussian',
+                 pos_embed_shift=None, pos_embed_jitter=None, pos_embed_rescale=2.0):
         """
         Args:
             num_dim: Number of spatial dimensions (2 for images: H, W)
             dim: Head dimension
+            jitter_std: Standard deviation for Gaussian jittering (when mode='gaussian').
+                        Default 0.0 (disabled).
+            jitter_mode: Jittering mode - 'gaussian' (simple) or 'dinov3' (log-uniform).
+                        Default 'gaussian'.
+            pos_embed_shift: DINOv3-style uniform shift in [-shift, shift]. None = disabled.
+            pos_embed_jitter: DINOv3-style log-uniform jitter in [1/jitter, jitter]. None = disabled.
+            pos_embed_rescale: DINOv3-style global rescale in [1/rescale, rescale]. Default 2.0.
         """
         super().__init__()
         self.num_dim = num_dim
         self.dim = dim
+        self.jitter_std = jitter_std
+        self.jitter_mode = jitter_mode
+        self.pos_embed_shift = pos_embed_shift
+        self.pos_embed_jitter = pos_embed_jitter
+        self.pos_embed_rescale = pos_embed_rescale
 
         # Learnable generator parameters (Lie algebra)
         # Initialize with small random values
@@ -142,20 +155,118 @@ class LieRE(nn.Module):
         skew = upper_tri - upper_tri.transpose(-2, -1)
         return skew
 
-    def _get_rotations(self, dimensions, device, dtype):
+    def _get_jittered_positions(self, dimensions, device, training):
+        """
+        Generate position grid with optional jittering (Gaussian or DINOv3-style).
+
+        Supports two jittering modes:
+        - 'gaussian': Simple additive Gaussian noise
+        - 'dinov3': Normalized coords + shift/jitter/rescale (log-uniform)
+
+        Args:
+            dimensions: Tuple of spatial dimensions (H, W) for 2D
+            device: Target device
+            training: Whether in training mode
+
+        Returns:
+            Position tensor of shape [H*W, num_dim]
+        """
+        if self.jitter_mode == 'dinov3':
+            # DINOv3-style: normalized coordinates in [-1, +1]
+            coords_list = []
+            for dim_size in dimensions:
+                # Patch centers: [0.5, 1.5, 2.5, ..., dim_size-0.5]
+                coords = torch.arange(0.5, dim_size, dtype=torch.float32, device=device)
+                # Normalize to [-1, +1]
+                coords = coords / dim_size
+                coords = 2.0 * coords - 1.0
+                coords_list.append(coords)
+
+            # Create meshgrid
+            grids = torch.meshgrid(*coords_list, indexing='ij')
+            positions = torch.stack([grid.flatten() for grid in grids], dim=1)
+
+            # Apply DINOv3 augmentations during training
+            if training:
+                positions = self._augment_positions_dinov3(positions, device)
+
+        elif self.jitter_mode == 'gaussian':
+            # Original Gaussian mode
+            if training and self.jitter_std > 0:
+                # Generate base coordinate ranges for each dimension
+                ranges = []
+                for dim_size in dimensions:
+                    # Base positions: [0, 1, 2, ..., dim_size-1]
+                    base_pos = torch.arange(dim_size, device=device, dtype=torch.float32)
+                    # Add Gaussian jitter
+                    jitter = torch.randn(dim_size, device=device) * self.jitter_std
+                    jittered_pos = base_pos + jitter
+                    ranges.append(jittered_pos)
+
+                # Create meshgrid and flatten
+                grids = torch.meshgrid(*ranges, indexing='ij')
+                positions = torch.stack([grid.flatten() for grid in grids], dim=1)
+            else:
+                # No jittering
+                positions = torch.cartesian_prod(
+                    *(torch.arange(dim_size, device=device, dtype=torch.float32)
+                      for dim_size in dimensions)
+                )
+        else:
+            raise ValueError(f"Unknown jitter_mode: {self.jitter_mode}")
+
+        return positions  # Shape: [H*W, num_dim]
+
+    def _augment_positions_dinov3(self, coords, device):
+        """
+        Apply DINOv3-style coordinate augmentations: shift, jitter, rescale.
+
+        Args:
+            coords: Position coordinates [H*W, num_dim]
+            device: Target device
+
+        Returns:
+            Augmented coordinates [H*W, num_dim]
+        """
+        import numpy as np
+
+        # 1. Shift: Uniform addition in [-shift, shift]
+        if self.pos_embed_shift is not None:
+            shift_hw = torch.empty((1, self.num_dim), device=device, dtype=coords.dtype)
+            shift_hw = shift_hw.uniform_(-self.pos_embed_shift, self.pos_embed_shift)
+            coords = coords + shift_hw
+
+        # 2. Jitter: Log-uniform multiplication per dimension [1/jitter, jitter]
+        if self.pos_embed_jitter is not None:
+            jitter_range = np.log(self.pos_embed_jitter)
+            jitter_hw = torch.empty((1, self.num_dim), device=device, dtype=coords.dtype)
+            jitter_hw = jitter_hw.uniform_(-jitter_range, jitter_range).exp()
+            coords = coords * jitter_hw
+
+        # 3. Rescale: Global log-uniform scaling [1/rescale, rescale]
+        if self.pos_embed_rescale is not None:
+            rescale_range = np.log(self.pos_embed_rescale)
+            rescale_hw = torch.empty(1, device=device, dtype=coords.dtype)
+            rescale_hw = rescale_hw.uniform_(-rescale_range, rescale_range).exp()
+            coords = coords * rescale_hw
+
+        return coords
+
+    def _get_rotations(self, dimensions, device, dtype, training=False):
         """
         Generate rotation matrices for given spatial dimensions using Cayley transform.
-        
+
         The Cayley transform maps a skew-symmetric matrix A to a rotation matrix R:
         R = (I - A)^{-1} (I + A)
-        
-        This is computationally cheaper than matrix exponential and compatible with 
+
+        This is computationally cheaper than matrix exponential and compatible with
         CUDA graphs / torch.compile.
 
         Args:
             dimensions: Tuple of spatial dimensions (H, W) for 2D
             device: Target device
             dtype: Target dtype
+            training: Whether in training mode (enables jittering if configured)
 
         Returns:
             Rotation matrices of shape [num_positions, dim, dim]
@@ -165,12 +276,9 @@ class LieRE(nn.Module):
         upper_triangle = torch.triu(self.generator_params, diagonal=1)
         skew_matrices = upper_triangle - upper_triangle.transpose(-1, -2)  # [num_dim, dim, dim]
 
-        # Generate all positions using cartesian product (VECTORIZED - NO LOOPS!)
+        # Generate positions with optional jittering (DINOv3-style)
         # For 2D with dimensions=(32, 32): creates [1024, 2] tensor
-        positions = torch.cartesian_prod(
-            *(torch.arange(dim_size, device=device, dtype=torch.float32)
-              for dim_size in dimensions)
-        )  # Shape: [H*W, num_dim]
+        positions = self._get_jittered_positions(dimensions, device, training)  # Shape: [H*W, num_dim]
 
         # Vectorized computation using broadcasting (Stanford MIMI approach)
         # Reshape positions: [H*W, num_dim] -> [H*W, num_dim, 1, 1]
@@ -203,6 +311,9 @@ class LieRE(nn.Module):
         """
         Apply LieRE to query or key tensor.
 
+        During training with jitter_std > 0, applies coordinate jittering to
+        position grid for learning continuous positional representations.
+
         Args:
             x: Input tensor of shape [B, num_heads, seq_len, head_dim]
             dimensions: Tuple of spatial dimensions (H, W) for 2D
@@ -212,8 +323,8 @@ class LieRE(nn.Module):
         """
         B, num_heads, seq_len, head_dim = x.shape
 
-        # Get rotation matrices for these dimensions
-        rotations = self._get_rotations(dimensions, x.device, x.dtype)  # [seq_len, head_dim, head_dim]
+        # Get rotation matrices for these dimensions (with optional jittering during training)
+        rotations = self._get_rotations(dimensions, x.device, x.dtype, training=self.training)  # [seq_len, head_dim, head_dim]
 
         # Apply rotation: x @ R^T for each position
         # x: [B, num_heads, seq_len, head_dim]
@@ -249,6 +360,11 @@ class DifferentialAttention(nn.Module):
         use_rope=True,
         rope_base=10000,
         use_liere=False,
+        liere_jitter_std=0.0,
+        liere_jitter_mode='gaussian',
+        liere_pos_embed_shift=None,
+        liere_pos_embed_jitter=None,
+        liere_pos_embed_rescale=2.0,
     ):
         """
         Differential (two-branch) attention with QK normalization,
@@ -279,7 +395,15 @@ class DifferentialAttention(nn.Module):
 
         # Initialize LieRE if requested
         if self.use_liere:
-            self.liere = LieRE(num_dim=2, dim=self.head_dim)  # 2D for images (H, W)
+            self.liere = LieRE(
+                num_dim=2,  # 2D for images (H, W)
+                dim=self.head_dim,
+                jitter_std=liere_jitter_std,
+                jitter_mode=liere_jitter_mode,
+                pos_embed_shift=liere_pos_embed_shift,
+                pos_embed_jitter=liere_pos_embed_jitter,
+                pos_embed_rescale=liere_pos_embed_rescale
+            )
 
         # Separate V projections to avoid capacity loss after subtraction.
         self.q_proj = nn.Linear(dim, 2 * dim, bias=qkv_bias)

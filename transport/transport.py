@@ -50,6 +50,8 @@ class Transport:
         use_mg=False,
         mg_lambda=0.1,
         mg_energy_head='dot',
+        mask_augment=False,
+        mask_prob=0.5,
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -66,6 +68,60 @@ class Transport:
         self.use_mg = use_mg
         self.mg_lambda = mg_lambda
         self.mg_energy_head = mg_energy_head
+        # Masking augmentation (applied to corrupted xt, not clean x1 target)
+        self.mask_augment = mask_augment
+        self.mask_prob = mask_prob
+
+    def apply_mask_augmentation(self, xt):
+        """Apply masking to corrupted samples (NOT to clean targets).
+
+        This creates robustness by training the model to handle masked inputs,
+        but the target remains clean data (proper equilibrium).
+
+        Args:
+            xt: Corrupted samples (after Gaussian noise mixing)
+        Returns:
+            Masked version of xt (with probability mask_prob)
+        """
+        import random
+        if not self.mask_augment or random.random() > self.mask_prob:
+            return xt
+
+        B, C, H, W = xt.shape
+        device = xt.device
+
+        # Apply masking per sample in batch
+        masked_xt = xt.clone()
+        for b in range(B):
+            if random.random() <= self.mask_prob:
+                mask = th.ones((1, H, W), device=device)
+
+                # Random strategy: large patches, small patches, or both
+                strategy = random.randint(0, 2)
+
+                # Large patches (structural)
+                if strategy == 0 or strategy == 2:
+                    num_large = random.randint(1, 3)
+                    for _ in range(num_large):
+                        ph = random.randint(H // 4, H // 2)
+                        pw = random.randint(W // 4, W // 2)
+                        top = random.randint(0, H - ph)
+                        left = random.randint(0, W - pw)
+                        mask[:, top:top+ph, left:left+pw] = 0
+
+                # Small patches (texture)
+                if strategy == 1 or strategy == 2:
+                    num_small = random.randint(4, 16)
+                    for _ in range(num_small):
+                        ph = random.randint(1, H // 8)
+                        pw = random.randint(1, W // 8)
+                        top = random.randint(0, H - ph)
+                        left = random.randint(0, W - pw)
+                        mask[:, top:top+ph, left:left+pw] = 0
+
+                masked_xt[b] = masked_xt[b] * mask
+
+        return masked_xt
 
     def prior_logp(self, z):
         '''
@@ -203,6 +259,11 @@ class Transport:
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         ut = ut * self.get_ct(t)[:,None,None,None] # use energy-compatible target
+
+        # Apply masking to corrupted sample (NOT to clean target x1)
+        # This trains robustness while keeping clean data as equilibrium
+        if self.mask_augment:
+            xt = self.apply_mask_augmentation(xt)
 
         # Model-Guidance: Compute energy-guided targets if enabled
         if self.use_mg and self.mg_lambda > 0:
