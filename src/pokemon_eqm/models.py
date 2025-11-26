@@ -1,3 +1,11 @@
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+# --------------------------------------------------------
+# References:
+# GLIDE: https://github.com/openai/glide-text2im
+# MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
+# --------------------------------------------------------
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,6 +15,11 @@ from timm.models.vision_transformer import PatchEmbed
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+#################################################################################
+#               Embedding Layers for Timesteps and Class Labels                 #
+#################################################################################
 
 class TimestepEmbedder(nn.Module):
     """
@@ -25,7 +38,13 @@ class TimestepEmbedder(nn.Module):
     def timestep_embedding(t, dim, max_period=10000):
         """
         Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
         """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
         half = dim // 2
         freqs = torch.exp(
             -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
@@ -41,6 +60,7 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
+
 class LabelEmbedder(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
@@ -53,6 +73,9 @@ class LabelEmbedder(nn.Module):
         self.dropout_prob = dropout_prob
 
     def token_drop(self, labels, force_drop_ids=None):
+        """
+        Drops labels to enable classifier-free guidance.
+        """
         if force_drop_ids is None:
             drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
         else:
@@ -67,39 +90,32 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
-
-class SwiGLU(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.SiLU, drop=0.):
+class Mlp(nn.Module):
+    """
+    MLP as used in Vision Transformer, MLP-Mixer and related networks
+    """
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        
-        self.fc1_g = nn.Linear(in_features, hidden_features)
-        self.fc1_x = nn.Linear(in_features, hidden_features)
+        self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        x_g = self.fc1_g(x)
-        x_x = self.fc1_x(x)
-        x = self.act(x_g) * x_x
+        x = self.fc1(x)
+        x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
         x = self.drop(x)
         return x
+
+
+#################################################################################
+#                                 Core EqM Model                                #
+#################################################################################
 
 class LieRE(nn.Module):
     """
@@ -345,20 +361,14 @@ class LieRE(nn.Module):
         return output
 
 
-class DifferentialAttention(nn.Module):
+class Attention(nn.Module):
     def __init__(
         self,
         dim,
         num_heads=8,
-        kv_heads=None,
         qkv_bias=False,
         attn_drop=0.,
         proj_drop=0.,
-        use_qk_norm=True,
-        head_drop=0.0,
-        window_size=None,
-        use_rope=True,
-        rope_base=10000,
         use_liere=False,
         liere_jitter_std=0.0,
         liere_jitter_mode='gaussian',
@@ -366,38 +376,21 @@ class DifferentialAttention(nn.Module):
         liere_pos_embed_jitter=None,
         liere_pos_embed_rescale=2.0,
     ):
-        """
-        Differential (two-branch) attention with QK normalization,
-        grouped/shared KV heads, head drop regularization, safer lambda init,
-        and positional encodings (2D Axial RoPE or LieRE).
-        """
         super().__init__()
-        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
         self.num_heads = num_heads
-        self.kv_heads = kv_heads or num_heads  # multi-/grouped-query support
-        assert dim % self.kv_heads == 0, 'dim should be divisible by kv_heads'
-        assert self.num_heads % self.kv_heads == 0, 'num_heads must be divisible by kv_heads'
-        self.head_dim = dim // num_heads
-        self.use_qk_norm = use_qk_norm
-        self.head_drop = head_drop
-        self.window_size = window_size
-        self.use_rope = use_rope
-        self.rope_base = rope_base
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
         self.use_liere = use_liere
 
-        # Can't use both RoPE and LieRE simultaneously
-        if self.use_rope and self.use_liere:
-            raise ValueError("Cannot use both RoPE and LieRE. Set use_liere=True and use_rope=False for LieRE.")
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
 
-        # RoPE requires even head dimension (split in half for H and W)
-        if self.use_rope:
-            assert self.head_dim % 2 == 0, f'head_dim must be even for RoPE, got {self.head_dim}'
-
-        # Initialize LieRE if requested
         if self.use_liere:
             self.liere = LieRE(
-                num_dim=2,  # 2D for images (H, W)
-                dim=self.head_dim,
+                num_dim=2,
+                dim=head_dim,
                 jitter_std=liere_jitter_std,
                 jitter_mode=liere_jitter_mode,
                 pos_embed_shift=liere_pos_embed_shift,
@@ -405,228 +398,40 @@ class DifferentialAttention(nn.Module):
                 pos_embed_rescale=liere_pos_embed_rescale
             )
 
-        # Separate V projections to avoid capacity loss after subtraction.
-        self.q_proj = nn.Linear(dim, 2 * dim, bias=qkv_bias)
-        self.k_proj = nn.Linear(dim, 2 * dim * self.kv_heads // self.num_heads, bias=qkv_bias)
-        self.v_proj1 = nn.Linear(dim, dim * self.kv_heads // self.num_heads, bias=qkv_bias)
-        self.v_proj2 = nn.Linear(dim, dim * self.kv_heads // self.num_heads, bias=qkv_bias)
-
-        # Start lambda small via softplus so out1 dominates early training.
-        self.lambda_p = nn.Parameter(torch.full((num_heads, 1, 1), -2.0))
-
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-        self._mask_cache = {}
-        self._rope_cache = {}  # Cache for RoPE embeddings
-
-    def _get_window_mask(self, seq_len, device, dtype):
-        if self.window_size is None:
-            return None
-        key = (seq_len, device, dtype)
-        if key in self._mask_cache:
-            return self._mask_cache[key]
-        side = int(seq_len ** 0.5)
-        if side * side != seq_len:
-            # 1D fallback
-            idx = torch.arange(seq_len, device=device)
-            dist = (idx[None, :] - idx[:, None]).abs()
-        else:
-            h = torch.arange(side, device=device)
-            w = torch.arange(side, device=device)
-            gh, gw = torch.meshgrid(h, w, indexing='ij')
-            coords = torch.stack([gh.reshape(-1), gw.reshape(-1)], dim=1)
-            dist = (coords[:, None, :] - coords[None, :, :]).abs()
-            dist = dist.max(dim=-1).values  # Chebyshev distance
-        mask = dist > self.window_size
-        # Convert to additive mask for SDPA (masked positions = -inf)
-        mask = mask.to(dtype)
-        mask = mask.masked_fill(mask == 1, float('-inf'))
-        self._mask_cache[key] = mask
-        return mask
-
-    @staticmethod
-    def _rotate_half(x):
-        """
-        Rotates half the hidden dims of the input for RoPE application.
-        Used to implement complex multiplication in the rotary embedding.
-        """
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat([-x2, x1], dim=-1)
-
-    def _get_rope(self, seq_len, device, dtype):
-        """
-        Generate 2D Axial RoPE (Rotary Position Embeddings) for a square grid.
-        Splits head_dim in half: first half for height, second half for width.
-
-        Args:
-            seq_len: Number of patches (assumes square grid: seq_len = H * W)
-            device: Target device for the embeddings
-            dtype: Target dtype for the embeddings
-
-        Returns:
-            cos, sin: Cosine and sine embeddings of shape [1, 1, seq_len, head_dim]
-        """
-        # Check cache first
-        key = (seq_len, device, dtype)
-        if key in self._rope_cache:
-            return self._rope_cache[key]
-
-        # Compute grid size (assume square)
-        side = int(seq_len ** 0.5)
-        if side * side != seq_len:
-            # Fallback to 1D for non-square sequences
-            dim_half = self.head_dim // 2
-            inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, dim_half, 2, device=device, dtype=torch.float32) / dim_half))
-            pos = torch.arange(seq_len, device=device, dtype=torch.float32)
-            theta = torch.outer(pos, inv_freq)
-            theta = theta.repeat(1, 2)  # [seq_len, dim_half]
-            # Pad to full head_dim
-            theta = torch.cat([theta, theta], dim=1)  # [seq_len, head_dim]
-        else:
-            # 2D axial RoPE
-            dim_half = self.head_dim // 2
-            dim_quarter = dim_half // 2
-
-            # Inverse frequencies for RoPE
-            inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, dim_quarter, 1, device=device, dtype=torch.float32) / dim_quarter))
-
-            # Create 2D position grid
-            pos_h = torch.arange(side, device=device, dtype=torch.float32)
-            pos_w = torch.arange(side, device=device, dtype=torch.float32)
-            grid_h, grid_w = torch.meshgrid(pos_h, pos_w, indexing='ij')
-            pos_h = grid_h.reshape(-1)  # [seq_len]
-            pos_w = grid_w.reshape(-1)  # [seq_len]
-
-            # Compute theta for height and width separately
-            theta_h = torch.outer(pos_h, inv_freq)  # [seq_len, dim_quarter]
-            theta_w = torch.outer(pos_w, inv_freq)  # [seq_len, dim_quarter]
-
-            # Concatenate: first half for height, second half for width
-            theta = torch.cat([theta_h, theta_w], dim=1)  # [seq_len, dim_half]
-            # Duplicate to cover full head_dim (apply same rotation to both halves)
-            theta = torch.cat([theta, theta], dim=1)  # [seq_len, head_dim]
-
-        # Compute cos and sin
-        cos = theta.cos().to(dtype)  # [seq_len, head_dim]
-        sin = theta.sin().to(dtype)  # [seq_len, head_dim]
-
-        # Reshape to [1, 1, seq_len, head_dim] for broadcasting
-        cos = cos[None, None, :, :]
-        sin = sin[None, None, :, :]
-
-        # Cache the result - clone to avoid reference issues with torch.compile
-        self._rope_cache[key] = (cos.clone(), sin.clone())
-        return cos, sin
-
-    def _apply_rope(self, x):
-        """
-        Apply 2D Axial RoPE to query or key tensor.
-
-        Args:
-            x: Input tensor of shape [B, num_heads, seq_len, head_dim]
-
-        Returns:
-            Tensor with RoPE applied, same shape as input
-        """
-        _, _, seq_len, _ = x.shape
-        cos, sin = self._get_rope(seq_len, x.device, x.dtype)
-
-        # Apply rotary embedding: x * cos + rotate_half(x) * sin
-        return x * cos + self._rotate_half(x) * sin
-
     def forward(self, x):
         B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
-        # Prefer flash/memory-efficient SDPA when available
-        try:
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_math_sdp(True)
-        except Exception:
-            pass
-
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v1 = self.v_proj1(x)
-        v2 = self.v_proj2(x)
-
-        q = q.reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        k = k.reshape(B, N, 2, self.kv_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        v1 = v1.reshape(B, N, self.kv_heads, self.head_dim).permute(0, 2, 1, 3)
-        v2 = v2.reshape(B, N, self.kv_heads, self.head_dim).permute(0, 2, 1, 3)
-
-        q1, q2 = q[0], q[1]
-        k1, k2 = k[0], k[1]
-
-        # Expand grouped KV to per-head tensors if kv_heads < num_heads
-        if self.kv_heads != self.num_heads:
-            repeat = self.num_heads // self.kv_heads
-            k1 = k1.repeat_interleave(repeat, dim=1)
-            k2 = k2.repeat_interleave(repeat, dim=1)
-            v1 = v1.repeat_interleave(repeat, dim=1)
-            v2 = v2.repeat_interleave(repeat, dim=1)
-
-        # Apply positional encoding to Q and K (before QK normalization)
-        if self.use_rope:
-            # Apply 2D Axial RoPE (fixed rotations)
-            q1 = self._apply_rope(q1)
-            q2 = self._apply_rope(q2)
-            k1 = self._apply_rope(k1)
-            k2 = self._apply_rope(k2)
-        elif self.use_liere:
+        if self.use_liere:
             # Apply LieRE (learnable rotations)
-            # Compute spatial dimensions from sequence length
             side = int(N ** 0.5)
-            dimensions = (side, side)  # (H, W)
-            q1 = self.liere.apply_rotations(q1, dimensions)
-            q2 = self.liere.apply_rotations(q2, dimensions)
-            k1 = self.liere.apply_rotations(k1, dimensions)
-            k2 = self.liere.apply_rotations(k2, dimensions)
+            dimensions = (side, side)
+            q = self.liere.apply_rotations(q, dimensions)
+            k = self.liere.apply_rotations(k, dimensions)
 
-        if self.use_qk_norm:
-            # Cast to float32 for norm operations (FP8 not supported by linalg.vector_norm)
-            # torch.compile will fuse these casts for performance
-            q1 = q1 / (q1.float().norm(dim=-1, keepdim=True) + 1e-6)
-            q2 = q2 / (q2.float().norm(dim=-1, keepdim=True) + 1e-6)
-            k1 = k1 / (k1.float().norm(dim=-1, keepdim=True) + 1e-6)
-            k2 = k2 / (k2.float().norm(dim=-1, keepdim=True) + 1e-6)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
 
-        attn_mask = self._get_window_mask(N, x.device, x.dtype)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
 
-        out1 = F.scaled_dot_product_attention(
-            q1, k1, v1,
-            attn_mask=attn_mask,
-            dropout_p=self.attn_drop.p if self.training else 0.0,
-        )
-        out2 = F.scaled_dot_product_attention(
-            q2, k2, v2,
-            attn_mask=attn_mask,
-            dropout_p=self.attn_drop.p if self.training else 0.0,
-        )
-
-        lam = F.softplus(self.lambda_p)
-        out = out1 - lam * out2
-
-        if self.head_drop > 0 and self.training:
-            keep = 1.0 - self.head_drop
-            mask = torch.empty((1, self.num_heads, 1, 1), device=x.device, dtype=out.dtype).bernoulli_(keep) / keep
-            out = out * mask
-
-        out = out.transpose(1, 2).reshape(B, N, C)
-        out = self.proj(out)
-        out = self.proj_drop(out)
-        return out
 
 class SiTBlock(nn.Module):
+    """
+    A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    """
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
-        self.norm1 = RMSNorm(hidden_size, eps=1e-6)
-        self.attn = DifferentialAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.norm2 = RMSNorm(hidden_size, eps=1e-6)
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.mlp = SwiGLU(in_features=hidden_size, hidden_features=mlp_hidden_dim, drop=0)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -638,10 +443,14 @@ class SiTBlock(nn.Module):
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
+
 class FinalLayer(nn.Module):
+    """
+    The final layer of SiT.
+    """
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm_final = RMSNorm(hidden_size, eps=1e-6)
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -654,11 +463,203 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
 
-# Positional Embedding Functions
+
+class EqM(nn.Module):
+    """
+    Diffusion model with a Transformer backbone.
+    """
+    def __init__(
+        self,
+        input_size=32,
+        patch_size=2,
+        in_channels=4,
+        hidden_size=1152,
+        depth=28,
+        num_heads=16,
+        mlp_ratio=4.0,
+        class_dropout_prob=0.1,
+        num_classes=1000,
+        learn_sigma=True,
+        uncond=True,
+        ebm='none',
+        use_liere=False,
+        liere_jitter_std=0.0,
+        liere_jitter_mode='gaussian',
+        liere_pos_embed_shift=None,
+        liere_pos_embed_jitter=None,
+        liere_pos_embed_rescale=2.0,
+    ):
+        super().__init__()
+        self.learn_sigma = learn_sigma
+        self.in_channels = in_channels
+        self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.patch_size = patch_size
+        self.num_heads = num_heads
+
+        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        num_patches = self.x_embedder.num_patches
+        # Will use fixed sin-cos embedding:
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+        block_kwargs = dict(
+            use_liere=use_liere,
+            liere_jitter_std=liere_jitter_std,
+            liere_jitter_mode=liere_jitter_mode,
+            liere_pos_embed_shift=liere_pos_embed_shift,
+            liere_pos_embed_jitter=liere_pos_embed_jitter,
+            liere_pos_embed_rescale=liere_pos_embed_rescale,
+        )
+
+        self.blocks = nn.ModuleList([
+            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs) for _ in range(depth)
+        ])
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.initialize_weights()
+        self.uncond = uncond
+        self.ebm = ebm
+
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Initialize (and freeze) pos_embed by sin-cos embedding:
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
+
+        # Initialize label embedding table:
+        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+
+        # Initialize timestep embedding MLP:
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        # Zero-out adaLN modulation layers in SiT blocks:
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        # Zero-out output layers:
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def unpatchify(self, x):
+        """
+        x: (N, T, patch_size**2 * C)
+        imgs: (N, H, W, C)
+        """
+        c = self.out_channels
+        p = self.x_embedder.patch_size[0]
+        h = w = int(x.shape[1] ** 0.5)
+        assert h * w == x.shape[1]
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        return imgs
+
+    def forward(self, x0, t, y, return_act=False, get_energy=False, train=False):
+        """
+        Forward pass of EqM.
+        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
+        t: (N,) tensor of diffusion timesteps
+        y: (N,) tensor of class labels
+        """
+        x0.requires_grad_(True)
+        if self.uncond: # removes noise/time conditioning by setting to 0
+            t = torch.zeros_like(t)
+        act = []
+        x = self.x_embedder(x0) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        t = self.t_embedder(t)                   # (N, D)
+        y = self.y_embedder(y, self.training)    # (N, D)
+        c = t + y                                # (N, D)
+        for block in self.blocks:
+            x = block(x, c)                      # (N, T, D)
+            act.append(x)
+        x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
+        x = self.unpatchify(x)                   # (N, out_channels, H, W)
+        if self.learn_sigma:
+            x, _ = x.chunk(2, dim=1)
+
+        # explicit energy
+        E=0
+        if self.ebm == 'l2':
+            E = -torch.sum(x**2, dim=(1,2,3))/2
+            if E.requires_grad:
+                x = torch.autograd.grad([E.sum()],[x0],create_graph=train)[0] 
+        if self.ebm == 'dot':
+            E = torch.sum(x*x0, dim=(1,2,3))
+            if E.requires_grad:
+                x = torch.autograd.grad([E.sum()],[x0],create_graph=train)[0]
+        if self.ebm == 'mean':
+            E = torch.sum(x*x0, dim=(1,2,3))
+            if E.requires_grad:
+                x = torch.autograd.grad([E.sum()],[x0],create_graph=train)[0]           
+        if get_energy:
+            return x, -E
+        if return_act: 
+            return x, act
+        return x
+
+    def forward_with_cfg(self, x, t, y, cfg_scale, return_act=False, get_energy=False, train=False):
+        """
+        Forward pass of EqM, but also batches the uncondional forward pass for classifier-free guidance.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
+        half = x[: len(x) // 2]
+        combined = torch.cat([half, half], dim=0)
+        model_out = self.forward(combined, t, y, return_act=return_act, get_energy=get_energy, train=train)
+        if get_energy:
+            x, E = model_out
+            model_out=x
+        if return_act:
+            act = model_out[1]
+            model_out = model_out[0]
+            eps, rest = model_out[:, :3], model_out[:, 3:]
+            cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+            half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+            eps = torch.cat([half_eps, half_eps], dim=0)
+            return torch.cat([eps, rest], dim=1), act
+        # For exact reproducibility reasons, we apply classifier-free guidance on only
+        # three channels by default. The standard approach to cfg applies it to all channels.
+        # This can be done by uncommenting the following line and commenting-out the line following that.
+        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        eps, rest = model_out[:, :3], model_out[:, 3:]
+        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = torch.cat([half_eps, half_eps], dim=0)
+        if get_energy:
+            return torch.cat([eps, rest], dim=1), E
+        return torch.cat([eps, rest], dim=1)
+
+
+#################################################################################
+#                   Sine/Cosine Positional Embedding Functions                  #
+#################################################################################
+# https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
+
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
+    """
+    grid_size: int of the grid height and width
+    return:
+    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    """
     grid_h = np.arange(grid_size, dtype=np.float32)
     grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)
+    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
     grid = np.stack(grid, axis=0)
 
     grid = grid.reshape([2, 1, grid_size, grid_size])
@@ -667,24 +668,83 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=
         pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
     return pos_embed
 
+
 def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     assert embed_dim % 2 == 0
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
-    emb = np.concatenate([emb_h, emb_w], axis=1)
+
+    # use half of dimensions to encode grid_h
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+
+    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
     return emb
 
+
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    embed_dim: output dimension for each position
+    pos: a list of positions to be encoded: size (M,)
+    out: (M, D)
+    """
     assert embed_dim % 2 == 0
     omega = np.arange(embed_dim // 2, dtype=np.float64)
     omega /= embed_dim / 2.
-    omega = 1. / 10000**omega
+    omega = 1. / 10000**omega  # (D/2,)
 
-    pos = pos.reshape(-1)
-    out = np.einsum('m,d->md', pos, omega)
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
 
-    emb_sin = np.sin(out)
-    emb_cos = np.cos(out)
+    emb_sin = np.sin(out) # (M, D/2)
+    emb_cos = np.cos(out) # (M, D/2)
 
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
+
+
+#################################################################################
+#                                   EqM Configs                                  #
+#################################################################################
+
+def EqM_XL_2(**kwargs):
+    return EqM(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+
+def EqM_XL_4(**kwargs):
+    return EqM(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+
+def EqM_XL_8(**kwargs):
+    return EqM(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
+
+def EqM_L_2(**kwargs):
+    return EqM(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+
+def EqM_L_4(**kwargs):
+    return EqM(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
+
+def EqM_L_8(**kwargs):
+    return EqM(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
+
+def EqM_B_2(**kwargs):
+    return EqM(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+
+def EqM_B_4(**kwargs):
+    return EqM(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
+
+def EqM_B_8(**kwargs):
+    return EqM(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
+
+def EqM_S_2(**kwargs):
+    return EqM(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
+
+def EqM_S_4(**kwargs):
+    return EqM(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
+
+def EqM_S_8(**kwargs):
+    return EqM(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
+
+
+EqM_models = {
+    'EqM-XL/2': EqM_XL_2,  'EqM-XL/4': EqM_XL_4,  'EqM-XL/8': EqM_XL_8,
+    'EqM-L/2':  EqM_L_2,   'EqM-L/4':  EqM_L_4,   'EqM-L/8':  EqM_L_8,
+    'EqM-B/2':  EqM_B_2,   'EqM-B/4':  EqM_B_4,   'EqM-B/8':  EqM_B_8,
+    'EqM-S/2':  EqM_S_2,   'EqM-S/4':  EqM_S_4,   'EqM-S/8':  EqM_S_8,
+}

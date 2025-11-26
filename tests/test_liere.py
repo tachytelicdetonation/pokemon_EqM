@@ -6,7 +6,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from models.layers import LieRE, DifferentialAttention
+from models.layers import LieRE, Attention
 from models import EqM_models
 
 def test_liere_standalone():
@@ -50,25 +50,24 @@ def test_liere_standalone():
     return True
 
 
-def test_differential_attention_with_liere():
+def test_attention_with_liere():
     """Test DifferentialAttention with LieRE enabled."""
     print("=" * 80)
-    print("Test 2: DifferentialAttention with LieRE")
+    print("Test 2: Attention with LieRE")
     print("=" * 80)
 
     # Create attention module with LieRE
     dim = 512
     num_heads = 8
-    attn_liere = DifferentialAttention(
+    attn_liere = Attention(
         dim=dim,
         num_heads=num_heads,
-        use_rope=False,
         use_liere=True
     )
 
     # Count parameters
     num_params = sum(p.numel() for p in attn_liere.parameters() if p.requires_grad)
-    print(f"✓ DifferentialAttention with LieRE: {num_params:,} parameters")
+    print(f"✓ Attention with LieRE: {num_params:,} parameters")
 
     # Test forward pass
     B, N, C = 2, 256, 512  # 16x16 patches
@@ -85,15 +84,7 @@ def test_differential_attention_with_liere():
     print(f"✓ LieRE gradients flow: grad_norm = {liere_grad_norm:.6f}")
 
     # Compare with RoPE
-    attn_rope = DifferentialAttention(
-        dim=dim,
-        num_heads=num_heads,
-        use_rope=True,
-        use_liere=False
-    )
-    num_params_rope = sum(p.numel() for p in attn_rope.parameters() if p.requires_grad)
-    print(f"✓ DifferentialAttention with RoPE: {num_params_rope:,} parameters")
-    print(f"  LieRE adds {num_params - num_params_rope:,} learnable parameters")
+
 
     print()
     return True
@@ -110,7 +101,6 @@ def test_eqm_model_with_liere():
         input_size=32,  # 32x32 latent space (256x256 image / 8)
         num_classes=1000,
         in_channels=4,
-        use_rope=False,
         use_liere=True
     )
 
@@ -134,18 +124,7 @@ def test_eqm_model_with_liere():
     print(f"✓ Forward pass successful: {x.shape} -> {output.shape}")
 
     # Compare with RoPE model
-    model_rope = EqM_models['EqM-L/2'](
-        input_size=32,
-        num_classes=1000,
-        in_channels=4,
-        use_rope=True,
-        use_liere=False
-    )
 
-    num_params_rope = sum(p.numel() for p in model_rope.parameters())
-    trainable_params_rope = sum(p.numel() for p in model_rope.parameters() if p.requires_grad)
-    print(f"✓ EqM-L/2 with RoPE: {num_params_rope:,} total params, {trainable_params_rope:,} trainable")
-    print(f"  LieRE adds {trainable_params - trainable_params_rope:,} learnable parameters")
 
     # Test backward pass
     model_liere.train()
@@ -183,24 +162,7 @@ def test_eqm_model_with_liere():
     return True
 
 
-def test_rope_liere_mutual_exclusion():
-    """Test that RoPE and LieRE cannot be used simultaneously."""
-    print("=" * 80)
-    print("Test 4: RoPE-LieRE Mutual Exclusion")
-    print("=" * 80)
 
-    try:
-        attn = DifferentialAttention(
-            dim=512,
-            num_heads=8,
-            use_rope=True,
-            use_liere=True  # This should fail
-        )
-        print("✗ FAILED: Should have raised ValueError!")
-        return False
-    except ValueError as e:
-        print(f"✓ Correctly raised ValueError: {str(e)}")
-        return True
 
 
 def test_liere_jittering_disabled():
@@ -376,7 +338,6 @@ def test_eqm_model_with_liere_jittering():
         input_size=32,
         num_classes=1000,
         in_channels=4,
-        use_rope=False,
         use_liere=True,
         liere_jitter_std=jitter_std
     )
@@ -593,7 +554,6 @@ def test_eqm_model_with_dinov3_jittering():
         input_size=32,
         num_classes=1000,
         in_channels=4,
-        use_rope=False,
         use_liere=True,
         liere_jitter_mode='dinov3',
         liere_pos_embed_shift=0.1,
@@ -652,9 +612,9 @@ def main():
 
     tests = [
         test_liere_standalone,
-        test_differential_attention_with_liere,
+        test_attention_with_liere,
         test_eqm_model_with_liere,
-        test_rope_liere_mutual_exclusion,
+        # test_rope_liere_mutual_exclusion,
         test_liere_jittering_disabled,
         test_liere_jittering_enabled,
         test_liere_jittering_train_eval_mode,

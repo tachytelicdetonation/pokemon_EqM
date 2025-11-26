@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pokemon_eqm"
+version = "0.1.0"
+description = "Pokemon Equilibrium Matching"
+authors = [
+  { name="Tanmay Deshmukh", email="tanmaydeshmukh@example.com" },
+]
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch",
+    "torchvision",
+    "numpy",
+    "Pillow",
+    "tqdm",
+    "wandb",
+    "diffusers",
+    "transformers",
+    "accelerate",
+    "einops",
+    "timm",
+]
+
+[project.scripts]
+train-pokemon = "scripts.train:main"
+generate-pokemon = "scripts.generate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

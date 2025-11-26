@@ -19,7 +19,7 @@ def main():
     parser.add_argument("--image_size", type=int, default=256, help="Image size")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers")
-    parser.add_argument("--vae_path", type=str, default="qwen_image_vae.safetensors", help="Path to VAE")
+    parser.add_argument("--vae_path", type=str, default=None, help="Path to VAE")
     parser.add_argument("--vae_type", type=str, default="ema", help="VAE type")
     
     args = parser.parse_args()

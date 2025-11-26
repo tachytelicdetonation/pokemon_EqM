@@ -42,7 +42,7 @@ def _safe_run(cmd):
 
 
 def _requirements_hash():
-    req_path = os.path.join(os.path.dirname(__file__), "..", "requirements.txt")
+    req_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", "requirements.txt")
     req_path = os.path.abspath(req_path)
     if not os.path.exists(req_path):
         return None

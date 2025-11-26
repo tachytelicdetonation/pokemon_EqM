@@ -7,12 +7,12 @@ from PIL import Image
 import numpy as np
 from torchvision import transforms
 
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-
-from models import EqM_models
-from transport import create_transport, Sampler
-from utils.vae import load_vae, decode_latents, encode_latents
-from args import get_args
+from pokemon_eqm.models import EqM_models
+from pokemon_eqm.transport import create_transport, Sampler
+from pokemon_eqm.utils.vae import load_vae, decode_latents, encode_latents
+from pokemon_eqm.utils.args import get_args
 
 def _load_noised_latents(path: str, vae, args, device) -> torch.Tensor:
     """Load partially noised inputs (image files or .npy latents) and encode to latents."""

@@ -1,14 +1,13 @@
-import enum
-import logging
-
-import numpy as np
 import torch as th
+import numpy as np
+import logging
 import torch.distributed as dist
 
-from . import path
-from .integrators import ode, sde
-from .utils import EasyDict, log_state, mean_flat
+import enum
 
+from . import path
+from .utils import EasyDict, log_state, mean_flat
+from .integrators import ode, sde
 
 class ModelType(enum.Enum):
     """
@@ -19,7 +18,6 @@ class ModelType(enum.Enum):
     SCORE = enum.auto()  # the model predicts \nabla \log p(x)
     VELOCITY = enum.auto()  # the model predicts v(x)
 
-
 class PathType(enum.Enum):
     """
     Which type of path to use.
@@ -28,7 +26,6 @@ class PathType(enum.Enum):
     LINEAR = enum.auto()
     GVP = enum.auto()
     VP = enum.auto()
-
 
 class WeightType(enum.Enum):
     """
@@ -41,6 +38,7 @@ class WeightType(enum.Enum):
 
 
 class Transport:
+
     def __init__(
         self,
         *,
@@ -49,11 +47,6 @@ class Transport:
         loss_type,
         train_eps,
         sample_eps,
-        use_mg=False,
-        mg_lambda=0.1,
-        mg_energy_head="dot",
-        mask_augment=False,
-        mask_prob=0.5,
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -66,277 +59,141 @@ class Transport:
         self.path_sampler = path_options[path_type]()
         self.train_eps = train_eps
         self.sample_eps = sample_eps
-        # Model-Guidance parameters
-        self.use_mg = use_mg
-        self.mg_lambda = mg_lambda
-        self.mg_energy_head = mg_energy_head
-        # Masking augmentation (applied to corrupted xt, not clean x1 target)
-        self.mask_augment = mask_augment
-        self.mask_prob = mask_prob
-
-    def apply_mask_augmentation(self, xt):
-        """Apply masking to corrupted samples (NOT to clean targets).
-
-        This creates robustness by training the model to handle masked inputs,
-        but the target remains clean data (proper equilibrium).
-
-        Args:
-            xt: Corrupted samples (after Gaussian noise mixing)
-        Returns:
-            Masked version of xt (with probability mask_prob)
-        """
-        import random
-
-        if not self.mask_augment or random.random() > self.mask_prob:
-            return xt
-
-        B, C, H, W = xt.shape
-        device = xt.device
-
-        # Apply masking per sample in batch
-        masked_xt = xt.clone()
-        for b in range(B):
-            if random.random() <= self.mask_prob:
-                mask = th.ones((1, H, W), device=device)
-
-                # Random strategy: large patches, small patches, or both
-                strategy = random.randint(0, 2)
-
-                # Large patches (structural)
-                if strategy == 0 or strategy == 2:
-                    num_large = random.randint(1, 3)
-                    for _ in range(num_large):
-                        ph = random.randint(H // 4, H // 2)
-                        pw = random.randint(W // 4, W // 2)
-                        top = random.randint(0, H - ph)
-                        left = random.randint(0, W - pw)
-                        mask[:, top : top + ph, left : left + pw] = 0
-
-                # Small patches (texture)
-                if strategy == 1 or strategy == 2:
-                    num_small = random.randint(4, 16)
-                    for _ in range(num_small):
-                        ph = random.randint(1, H // 8)
-                        pw = random.randint(1, W // 8)
-                        top = random.randint(0, H - ph)
-                        left = random.randint(0, W - pw)
-                        mask[:, top : top + ph, left : left + pw] = 0
-
-                masked_xt[b] = masked_xt[b] * mask
-
-        return masked_xt
 
     def prior_logp(self, z):
-        """
-        Standard multivariate normal prior
-        Assume z is batched
-        """
+        '''
+            Standard multivariate normal prior
+            Assume z is batched
+        '''
         shape = th.tensor(z.size())
         N = th.prod(shape[1:])
-        _fn = lambda x: -N / 2.0 * np.log(2 * np.pi) - th.sum(x**2) / 2.0
+        _fn = lambda x: -N / 2. * np.log(2 * np.pi) - th.sum(x ** 2) / 2.
         return th.vmap(_fn)(z)
+    
 
     def check_interval(
-        self,
-        train_eps,
-        sample_eps,
-        *,
+        self, 
+        train_eps, 
+        sample_eps, 
+        *, 
         diffusion_form="SBDM",
-        sde=False,
-        reverse=False,
+        sde=False, 
+        reverse=False, 
         eval=False,
         last_step_size=0.0,
     ):
         t0 = 0
         t1 = 1
         eps = train_eps if not eval else sample_eps
-        if type(self.path_sampler) in [path.VPCPlan]:
+        if (type(self.path_sampler) in [path.VPCPlan]):
+
             t1 = 1 - eps if (not sde or last_step_size == 0) else 1 - last_step_size
 
-        elif (type(self.path_sampler) in [path.ICPlan, path.GVPCPlan]) and (
-            self.model_type != ModelType.VELOCITY or sde
-        ):  # avoid numerical issue by taking a first semi-implicit step
-            t0 = (
-                eps
-                if (diffusion_form == "SBDM" and sde)
-                or self.model_type != ModelType.VELOCITY
-                else 0
-            )
-            t1 = 1 - eps if (not sde or last_step_size == 0) else 1 - last_step_size
+        elif (type(self.path_sampler) in [path.ICPlan, path.GVPCPlan]) \
+            and (self.model_type != ModelType.VELOCITY or sde): # avoid numerical issue by taking a first semi-implicit step
 
+            t0 = eps if (diffusion_form == "SBDM" and sde) or self.model_type != ModelType.VELOCITY else 0
+            t1 = 1 - eps if (not sde or last_step_size == 0) else 1 - last_step_size
+        
         if reverse:
             t0, t1 = 1 - t0, 1 - t1
 
         return t0, t1
 
+
     def sample(self, x1):
         """Sampling x0 & t based on shape of x1 (if needed)
-        Args:
-          x1 - data point; [batch, *dim]
+          Args:
+            x1 - data point; [batch, *dim]
         """
-
+        
         x0 = th.randn_like(x1)
         t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
         t = th.rand((x1.shape[0],)) * (t1 - t0) + t0
         t = t.to(x1)
         return t, x0, x1
 
-    def disp_loss(self, z):  # Dispersive Loss implementation (InfoNCE-L2 variant)
-        z = z.reshape((z.shape[0], -1))  # flatten
-        diff = th.nn.functional.pdist(z).pow(2) / z.shape[1]  # normalize by dimension
-        diff = th.concat(
-            (diff, diff, th.zeros(z.shape[0]).cuda())
-        )  # match JAX implementation of full BxB matrix
+    def disp_loss(self, z): # Dispersive Loss implementation (InfoNCE-L2 variant)
+        z = z.reshape((z.shape[0],-1)) # flatten
+        diff = th.nn.functional.pdist(z).pow(2)/z.shape[1] # normalize by dimension
+        diff = th.concat((diff, diff, th.zeros(z.shape[0]).cuda()))  # match JAX implementation of full BxB matrix
         return th.log(th.exp(-diff).mean())
 
-    def get_ct(self, t):  # ct implementation
+    def get_ct(self, t): #ct implementation
         interp = 0.8
         start = 1.0
-        ct = (
-            th.minimum(
-                start - (start - 1) / (interp) * t,
-                1 / (1 - interp) - 1 / (1 - interp) * t,
-            )
-            * 4
-        )
+        ct = th.minimum(start-(start-1)/(interp)*t, 1/(1-interp)-1/(1-interp)*t)*4
         return ct
 
-    def compute_energy_guidance(self, model, xt, t, x0, model_kwargs):
-        """Compute energy-based guidance signal for Model-Guidance training
-
-        Args:
-            model: The neural network model
-            xt: Noisy latent at time t
-            t: Time step
-            x0: Original noise sample
-            model_kwargs: Additional model arguments (labels, etc.)
-
-        Returns:
-            Energy gradient for guidance
-        """
-        # Enable gradients for xt
-        xt_guided = xt.detach().requires_grad_(True)
-
-        # Forward pass through model
-        with th.enable_grad():
-            pred = model(xt_guided, t, get_energy=True, **model_kwargs)
-
-            # Handle different output formats
-            if isinstance(pred, tuple):
-                pred, energy = pred
-            else:
-                pred, energy = pred, None
-
-            # Compute energy based on energy_head type
-            if self.mg_energy_head == "l2":
-                if energy is None:
-                    energy = -0.5 * th.sum(pred**2, dim=(1, 2, 3))
-            elif self.mg_energy_head == "dot":
-                if energy is None:
-                    energy = th.sum(pred * xt_guided, dim=(1, 2, 3))
-            elif self.mg_energy_head == "implicit":
-                # For implicit energy, return the prediction directly as guidance
-                return pred.detach()
-
-            # Compute gradient of energy w.r.t. xt
-            if energy is not None:
-                energy_grad = th.autograd.grad(
-                    outputs=energy.sum(),
-                    inputs=xt_guided,
-                    create_graph=False,  # Don't need second-order gradients
-                )[0]
-                return energy_grad.detach()
-            else:
-                # Fallback: use model prediction as guidance
-                return pred.detach()
-
-    def training_losses(self, model, x1, model_kwargs=None):
+    def training_losses(
+        self, 
+        model,  
+        x1, 
+        model_kwargs=None
+    ):
         """Loss for training the score model
         Args:
         - model: backbone model; could be score, noise, or velocity
         - x1: datapoint
         - model_kwargs: additional arguments for the model
         """
-        if model_kwargs == None:
+        if model_kwargs == None: 
             model_kwargs = {}
-        apply_disp_loss = model_kwargs.pop("apply_disp_loss", None)
-        return_act = model_kwargs.get("return_act", False)
-        if apply_disp_loss is None:
-            apply_disp_loss = return_act
-
+        
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
-        ut = ut * self.get_ct(t)[:, None, None, None]  # use energy-compatible target
-
-        # Apply masking to corrupted sample (NOT to clean target x1)
-        # This trains robustness while keeping clean data as equilibrium
-        if self.mask_augment:
-            xt = self.apply_mask_augmentation(xt)
-
-        # Model-Guidance: Compute energy-guided targets if enabled
-        if self.use_mg and self.mg_lambda > 0:
-            # Compute energy guidance signal
-            energy_guidance = self.compute_energy_guidance(
-                model, xt, t, x0, model_kwargs
-            )
-            # Blend velocity target with energy guidance
-            guided_ut = ut + self.mg_lambda * energy_guidance
-        else:
-            guided_ut = ut
-
+        ut = ut * self.get_ct(t)[:,None,None,None] # use energy-compatible target
         model_output = model(xt, t, **model_kwargs)
         disp_loss = 0
-        penultimate = None
 
         # get intermediate activation and apply Dispersive Loss
-        if return_act:
+        if "return_act" in model_kwargs and model_kwargs['return_act']:
             model_output, act = model_output
-            penultimate = act[-1]
-            if apply_disp_loss:
-                disp_loss = self.disp_loss(penultimate)
-
+            disp_loss = self.disp_loss(act[len(act)-1])
+        
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
 
         terms = {}
-        terms["pred"] = model_output
-        terms["penultimate"] = penultimate
+        terms['pred'] = model_output
         if self.model_type == ModelType.VELOCITY:
-            terms["loss"] = mean_flat(((model_output - guided_ut) ** 2))
-        else:
+            terms['loss'] = mean_flat(((model_output - ut) ** 2))
+        else: 
             _, drift_var = self.path_sampler.compute_drift(xt, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, xt))
             if self.loss_type in [WeightType.VELOCITY]:
                 weight = (drift_var / sigma_t) ** 2
             elif self.loss_type in [WeightType.LIKELIHOOD]:
-                weight = drift_var / (sigma_t**2)
+                weight = drift_var / (sigma_t ** 2)
             elif self.loss_type in [WeightType.NONE]:
                 weight = 1
             else:
                 raise NotImplementedError()
-
+            
             if self.model_type == ModelType.NOISE:
-                terms["loss"] = mean_flat(weight * ((model_output - x0) ** 2))
+                terms['loss'] = mean_flat(weight * ((model_output - x0) ** 2))
             else:
-                terms["loss"] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
-        terms["loss"] += 0.5 * disp_loss
+                terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
+        terms['loss'] += 0.5*disp_loss      
         return terms
+    
 
-    def get_drift(self):
+    def get_drift(
+        self
+    ):
         """member function for obtaining the drift of the probability flow ODE"""
-
         def score_ode(x, t, model, **model_kwargs):
             drift_mean, drift_var = self.path_sampler.compute_drift(x, t)
             model_output = model(x, t, **model_kwargs)
-            return -drift_mean + drift_var * model_output  # by change of variable
-
+            return (-drift_mean + drift_var * model_output) # by change of variable
+        
         def noise_ode(x, t, model, **model_kwargs):
             drift_mean, drift_var = self.path_sampler.compute_drift(x, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, x))
             model_output = model(x, t, **model_kwargs)
             score = model_output / -sigma_t
-            return -drift_mean + drift_var * score
-
+            return (-drift_mean + drift_var * score)
+        
         def velocity_ode(x, t, model, **model_kwargs):
             model_output = model(x, t, **model_kwargs)
             return model_output
@@ -347,43 +204,34 @@ class Transport:
             drift_fn = score_ode
         else:
             drift_fn = velocity_ode
-
+        
         def body_fn(x, t, model, **model_kwargs):
             model_output = drift_fn(x, t, model, **model_kwargs)
-            assert model_output.shape == x.shape, (
-                "Output shape from ODE solver must match input shape"
-            )
+            assert model_output.shape == x.shape, "Output shape from ODE solver must match input shape"
             return model_output
 
         return body_fn
+    
 
     def get_score(
         self,
     ):
-        """member function for obtaining score of
-        x_t = alpha_t * x + sigma_t * eps"""
+        """member function for obtaining score of 
+            x_t = alpha_t * x + sigma_t * eps"""
         if self.model_type == ModelType.NOISE:
-            score_fn = (
-                lambda x, t, model, **kwargs: model(x, t, **kwargs)
-                / -self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, x))[0]
-            )
+            score_fn = lambda x, t, model, **kwargs: model(x, t, **kwargs) / -self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, x))[0]
         elif self.model_type == ModelType.SCORE:
             score_fn = lambda x, t, model, **kwagrs: model(x, t, **kwagrs)
         elif self.model_type == ModelType.VELOCITY:
-            score_fn = (
-                lambda x, t, model, **kwargs: self.path_sampler.get_score_from_velocity(
-                    model(x, t, **kwargs), x, t
-                )
-            )
+            score_fn = lambda x, t, model, **kwargs: self.path_sampler.get_score_from_velocity(model(x, t, **kwargs), x, t)
         else:
             raise NotImplementedError()
-
+        
         return score_fn
 
 
 class Sampler:
     """Sampler class for the transport model"""
-
     def __init__(
         self,
         transport,
@@ -392,31 +240,30 @@ class Sampler:
         Args:
         - transport: an tranport object specify model prediction & interpolant type
         """
-
+        
         self.transport = transport
         self.drift = self.transport.get_drift()
         self.score = self.transport.get_score()
-
+    
     def __get_sde_diffusion_and_drift(
         self,
         *,
         diffusion_form="SBDM",
         diffusion_norm=1.0,
     ):
+
         def diffusion_fn(x, t):
-            diffusion = self.transport.path_sampler.compute_diffusion(
-                x, t, form=diffusion_form, norm=diffusion_norm
-            )
+            diffusion = self.transport.path_sampler.compute_diffusion(x, t, form=diffusion_form, norm=diffusion_norm)
             return diffusion
-
-        sde_drift = lambda x, t, model, **kwargs: self.drift(
-            x, t, model, **kwargs
-        ) + diffusion_fn(x, t) * self.score(x, t, model, **kwargs)
-
+        
+        sde_drift = \
+            lambda x, t, model, **kwargs: \
+                self.drift(x, t, model, **kwargs) + diffusion_fn(x, t) * self.score(x, t, model, **kwargs)
+    
         sde_diffusion = diffusion_fn
 
         return sde_drift, sde_diffusion
-
+    
     def __get_last_step(
         self,
         sde_drift,
@@ -425,27 +272,25 @@ class Sampler:
         last_step_size,
     ):
         """Get the last step function of the SDE solver"""
-
+    
         if last_step is None:
-            last_step_fn = lambda x, t, model, **model_kwargs: x
+            last_step_fn = \
+                lambda x, t, model, **model_kwargs: \
+                    x
         elif last_step == "Mean":
-            last_step_fn = (
-                lambda x, t, model, **model_kwargs: x
-                + sde_drift(x, t, model, **model_kwargs) * last_step_size
-            )
+            last_step_fn = \
+                lambda x, t, model, **model_kwargs: \
+                    x + sde_drift(x, t, model, **model_kwargs) * last_step_size
         elif last_step == "Tweedie":
-            alpha = (
-                self.transport.path_sampler.compute_alpha_t
-            )  # simple aliasing; the original name was too long
+            alpha = self.transport.path_sampler.compute_alpha_t # simple aliasing; the original name was too long
             sigma = self.transport.path_sampler.compute_sigma_t
-            last_step_fn = lambda x, t, model, **model_kwargs: x / alpha(t)[0][0] + (
-                sigma(t)[0][0] ** 2
-            ) / alpha(t)[0][0] * self.score(x, t, model, **model_kwargs)
+            last_step_fn = \
+                lambda x, t, model, **model_kwargs: \
+                    x / alpha(t)[0][0] + (sigma(t)[0][0] ** 2) / alpha(t)[0][0] * self.score(x, t, model, **model_kwargs)
         elif last_step == "Euler":
-            last_step_fn = (
-                lambda x, t, model, **model_kwargs: x
-                + self.drift(x, t, model, **model_kwargs) * last_step_size
-            )
+            last_step_fn = \
+                lambda x, t, model, **model_kwargs: \
+                    x + self.drift(x, t, model, **model_kwargs) * last_step_size
         else:
             raise NotImplementedError()
 
@@ -495,12 +340,11 @@ class Sampler:
             t0=t0,
             t1=t1,
             num_steps=num_steps,
-            sampler_type=sampling_method,
+            sampler_type=sampling_method
         )
 
-        last_step_fn = self.__get_last_step(
-            sde_drift, last_step=last_step, last_step_size=last_step_size
-        )
+        last_step_fn = self.__get_last_step(sde_drift, last_step=last_step, last_step_size=last_step_size)
+            
 
         def _sample(init, model, **model_kwargs):
             xs = _sde.sample(init, model, **model_kwargs)
@@ -513,7 +357,7 @@ class Sampler:
             return xs
 
         return _sample
-
+    
     def sample_ode(
         self,
         *,
@@ -526,7 +370,7 @@ class Sampler:
         """returns a sampling function with given ODE settings
         Args:
         - sampling_method: type of sampler used in solving the ODE; default to be Dopri5
-        - num_steps:
+        - num_steps: 
             - fixed solver (Euler, Heun): the actual number of integration steps performed
             - adaptive solver (Dopri5): the number of datapoints saved during integration; produced by interpolation
         - atol: absolute error tolerance for the solver
@@ -534,9 +378,7 @@ class Sampler:
         - reverse: whether solving the ODE in reverse (data to noise); default to False
         """
         if reverse:
-            drift = lambda x, t, model, **kwargs: self.drift(
-                x, th.ones_like(t) * (1 - t), model, **kwargs
-            )
+            drift = lambda x, t, model, **kwargs: self.drift(x, th.ones_like(t) * (1 - t), model, **kwargs)
         else:
             drift = self.drift
 
@@ -558,7 +400,7 @@ class Sampler:
             atol=atol,
             rtol=rtol,
         )
-
+        
         return _ode.sample
 
     def sample_ode_likelihood(
@@ -569,29 +411,27 @@ class Sampler:
         atol=1e-6,
         rtol=1e-3,
     ):
+        
         """returns a sampling function for calculating likelihood with given ODE settings
         Args:
         - sampling_method: type of sampler used in solving the ODE; default to be Dopri5
-        - num_steps:
+        - num_steps: 
             - fixed solver (Euler, Heun): the actual number of integration steps performed
             - adaptive solver (Dopri5): the number of datapoints saved during integration; produced by interpolation
         - atol: absolute error tolerance for the solver
         - rtol: relative error tolerance for the solver
         """
-
         def _likelihood_drift(x, t, model, **model_kwargs):
             x, _ = x
             eps = th.randint(2, x.size(), dtype=th.float, device=x.device) * 2 - 1
             t = th.ones_like(t) * (1 - t)
             with th.enable_grad():
                 x.requires_grad = True
-                grad = th.autograd.grad(
-                    th.sum(self.drift(x, t, model, **model_kwargs) * eps), x
-                )[0]
+                grad = th.autograd.grad(th.sum(self.drift(x, t, model, **model_kwargs) * eps), x)[0]
                 logp_grad = th.sum(grad * eps, dim=tuple(range(1, len(x.size()))))
                 drift = self.drift(x, t, model, **model_kwargs)
             return (-drift, logp_grad)
-
+        
         t0, t1 = self.transport.check_interval(
             self.transport.train_eps,
             self.transport.sample_eps,
