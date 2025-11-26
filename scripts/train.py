@@ -8,7 +8,7 @@ import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
 import numpy as np
@@ -37,12 +37,33 @@ from torchvision.transforms.functional import to_pil_image
 from pathlib import Path
 import torch.nn.functional as F
 
+class CenterCrop:
+    def __init__(self, image_size):
+        self.image_size = image_size
+    def __call__(self, pil_image):
+        return center_crop_arr(pil_image, self.image_size)
+
+class FlatFolderDataset(Dataset):
+    def __init__(self, root, transform=None):
+        self.root = root
+        self.files = sorted([os.path.join(root, f) for f in os.listdir(root) 
+                           if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        self.transform = transform
+    def __len__(self):
+        return len(self.files)
+    def __getitem__(self, idx):
+        img = Image.open(self.files[idx]).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        return img, 0 # Dummy label
+
 # Try to import utils.vae if available, otherwise fallback
 try:
     from pokemon_eqm.utils.vae import load_vae, encode_latents, decode_latents
     USE_UTILS_VAE = True
 except ImportError:
     USE_UTILS_VAE = False
+
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -251,7 +272,7 @@ def main(args):
 
     # Setup data:
     transform = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+        CenterCrop(args.image_size),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
@@ -261,20 +282,6 @@ def main(args):
         dataset = ImageFolder(args.data_path, transform=transform)
     except:
         # Fallback for flat directory
-        from torch.utils.data import Dataset
-        class FlatFolderDataset(Dataset):
-            def __init__(self, root, transform=None):
-                self.root = root
-                self.files = sorted([os.path.join(root, f) for f in os.listdir(root) 
-                                   if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-                self.transform = transform
-            def __len__(self):
-                return len(self.files)
-            def __getitem__(self, idx):
-                img = Image.open(self.files[idx]).convert('RGB')
-                if self.transform:
-                    img = self.transform(img)
-                return img, 0 # Dummy label
         dataset = FlatFolderDataset(args.data_path, transform=transform)
 
     loader = DataLoader(

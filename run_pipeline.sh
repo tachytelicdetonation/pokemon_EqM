@@ -20,11 +20,11 @@ uv pip install -r requirements.txt
 
 
 
-# 4. Download data (Skipped as script is missing/placeholder)
-# if [ ! -d "data/raw" ]; then
-#     echo "Downloading data..."
-#     python src/pokemon_eqm/utils/download.py
-# fi
+# 4. Download data
+if [ ! -d "data/raw" ] || [ -z "$(ls -A data/raw)" ]; then
+    echo "Downloading data..."
+    python src/pokemon_eqm/utils/download_dataset.py
+fi
 
 # 5. Run training
 echo "Starting training..."
