@@ -452,6 +452,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to JSON config file")
+    parser.add_argument("--run-id", type=str, default=None, help="WandB run ID for resuming")
     args = parser.parse_args()
     
     # Load config from JSON
@@ -463,8 +464,9 @@ if __name__ == "__main__":
     if os.path.exists(config_path):
         with open(config_path, 'r') as f:
             config = json.load(f)
-            # Convert dict to Namespace for compatibility
-            args = argparse.Namespace(**config)
+            # Update args with config values
+            for key, value in config.items():
+                setattr(args, key, value)
     else:
         raise FileNotFoundError(f"Config file {config_path} not found.")
 
