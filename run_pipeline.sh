@@ -20,15 +20,15 @@ uv pip install -r requirements.txt
 
 
 
-# 4. Download data
-if [ ! -d "data/raw" ]; then
-    echo "Downloading data..."
-    python scripts/download_data.py
-fi
+# 4. Download data (Skipped as script is missing/placeholder)
+# if [ ! -d "data/raw" ]; then
+#     echo "Downloading data..."
+#     python src/pokemon_eqm/utils/download.py
+# fi
 
 # 5. Run training
 echo "Starting training..."
-python train_pokemon.py --config base_128
+python scripts/train.py --config configs/production.json
 
 # 6. Generate samples from the newest run's latest checkpoint
 echo "Generating samples..."
@@ -46,4 +46,13 @@ if [ -z "$LATEST_CKPT" ]; then
 fi
 
 echo "Using checkpoint: $LATEST_CKPT"
-python generate_pokemon.py --ckpt "$LATEST_CKPT" --config base_128 --output_dir "$LATEST_RUN/generated_samples"
+# Pass arguments matching production.json where relevant
+python scripts/generate.py \
+    --ckpt "$LATEST_CKPT" \
+    --model "EqM-B/2" \
+    --image-size 256 \
+    --num-samples 16 \
+    --batch-size 16 \
+    --output-dir "$LATEST_RUN/generated_samples" \
+    --use-liere \
+    --uncond
