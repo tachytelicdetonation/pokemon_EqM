@@ -2,6 +2,8 @@ import os
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
+from PIL import Image
+import io
 
 def categorize_form(form_name):
     """Categorize a Pokemon form based on its name."""
@@ -65,18 +67,50 @@ def download_form(form_data, output_base_dir):
                     return
                 img_data = img_response.content
 
+        # Validate image before saving
+        try:
+            img = Image.open(io.BytesIO(img_data))
+            img.verify()  # Verify it's a valid image
+            # Re-open after verify (verify() can only be called once)
+            img = Image.open(io.BytesIO(img_data))
+            # Convert to RGBA to handle palette/transparency issues
+            img = img.convert('RGBA')
+        except Exception:
+            return  # Skip invalid images
+
         # Categorize and save
         category = categorize_form(form_name)
         category_dir = os.path.join(output_base_dir, category)
         os.makedirs(category_dir, exist_ok=True)
 
         filename = os.path.join(category_dir, f"{form_name}.png")
-        with open(filename, 'wb') as handler:
-            handler.write(img_data)
+        img.save(filename, 'PNG')
 
     except Exception as e:
         # Silently skip errors to avoid cluttering output
         pass
+
+
+def cleanup_corrupted_images(data_dir="data/raw"):
+    """Remove corrupted images that can't be loaded by PIL."""
+    print(f"Scanning {data_dir} for corrupted images...")
+    removed = 0
+    checked = 0
+
+    for root, dirs, files in os.walk(data_dir):
+        for f in files:
+            if f.endswith('.png'):
+                filepath = os.path.join(root, f)
+                checked += 1
+                try:
+                    with Image.open(filepath) as img:
+                        img.verify()
+                except Exception:
+                    print(f"  Removing corrupted: {filepath}")
+                    os.remove(filepath)
+                    removed += 1
+
+    print(f"Checked {checked} images, removed {removed} corrupted files.")
 
 def download_pokemon_data(output_dir="data/raw"):
     """
@@ -104,14 +138,25 @@ def download_pokemon_data(output_dir="data/raw"):
             desc="Downloading"
         ))
     
+    # Cleanup any corrupted images
+    print("\nValidating downloaded images...")
+    cleanup_corrupted_images(output_dir)
+
     # Print summary
     print("\nDownload complete! Summary:")
     for category in ['base', 'mega', 'regional', 'gigantamax', 'other']:
         category_dir = os.path.join(output_dir, category)
         if os.path.exists(category_dir):
-            count = len(os.listdir(category_dir))
+            count = len([f for f in os.listdir(category_dir) if f.endswith('.png')])
             print(f"  {category}: {count} images")
 
+
 if __name__ == "__main__":
-    download_pokemon_data()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--cleanup":
+        # Just cleanup existing data
+        data_dir = sys.argv[2] if len(sys.argv) > 2 else "data/raw"
+        cleanup_corrupted_images(data_dir)
+    else:
+        download_pokemon_data()
 
