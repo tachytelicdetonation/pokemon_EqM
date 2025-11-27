@@ -26,11 +26,17 @@ if [ ! -d "data/raw" ] || [ -z "$(ls -A data/raw)" ]; then
     python src/pokemon_eqm/utils/download_dataset.py
 fi
 
-# 5. Run training
+# 5. Create symlink for training (data/train -> data/raw)
+if [ ! -e "data/train" ]; then
+    echo "Creating data/train symlink..."
+    ln -sf raw data/train
+fi
+
+# 6. Run training
 echo "Starting training..."
 python scripts/train.py --config configs/production.json
 
-# 6. Generate samples from the newest run's latest checkpoint
+# 7. Generate samples from the newest run's latest checkpoint
 echo "Generating samples..."
 LATEST_RUN=$(ls -td results/pokemon-eqm-* 2>/dev/null | head -n 1 || true)
 if [ -z "$LATEST_RUN" ]; then
