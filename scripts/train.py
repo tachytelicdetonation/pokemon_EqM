@@ -533,55 +533,49 @@ def main(args):
                 # Helper to sample and log
                 def generate_and_log(noise, prefix, sampling_method="gd", num_steps=250, stepsize=0.0017, mu=0.3):
                     # Create labels
+                    n = noise.shape[0]
                     if "fixed" in prefix:
-                        sample_y = torch.arange(noise.shape[0], device=device) % args.num_classes
+                        sample_y = torch.arange(n, device=device) % args.num_classes
                     else:
-                        sample_y = torch.randint(args.num_classes, size=(noise.shape[0],), device=device)
+                        sample_y = torch.randint(args.num_classes, size=(n,), device=device)
                     
-                    # Prepare inputs
-                    xt = noise.clone()
-                    t = torch.ones((noise.shape[0],), device=device)
-                    
-                    if args.cfg_scale > 1.0:
-                        y_null = torch.tensor([args.num_classes] * noise.shape[0], device=device)
-                        y_in = torch.cat([sample_y, y_null], 0)
-                        model_kwargs = dict(y=y_in, cfg_scale=args.cfg_scale)
+                    # Setup classifier-free guidance (following reference implementation)
+                    use_cfg = args.cfg_scale > 1.0
+                    if use_cfg:
+                        # Double the noise and labels for CFG
+                        xt = torch.cat([noise, noise], 0)
+                        t = torch.ones((n * 2,), device=device)
+                        y_null = torch.tensor([args.num_classes] * n, device=device)
+                        y = torch.cat([sample_y, y_null], 0)
                         model_fn = ema.forward_with_cfg
                     else:
-                        model_kwargs = dict(y=sample_y)
+                        xt = noise.clone()
+                        t = torch.ones((n,), device=device)
+                        y = sample_y
                         model_fn = ema.forward
 
-                    # Sampling Loop (GD / NAG-GD)
+                    # Sampling Loop (GD / NAG-GD) - following reference implementation
                     if sampling_method in ["gd", "ngd"]:
                         m = torch.zeros_like(xt)
                         with torch.no_grad():
                             for i in range(num_steps - 1):
-                                if args.cfg_scale > 1.0:
-                                    xt_in = torch.cat([xt, xt], 0)
-                                    t_in = torch.cat([t, t], 0)
-                                    # forward_with_cfg expects (x, t, y, cfg_scale)
-                                    out = model_fn(xt_in, t_in, y_in, args.cfg_scale)
-                                else:
-                                    # forward expects (x, t, y)
-                                    out = model_fn(xt, t, sample_y)
-                                
-                                if not torch.is_tensor(out):
-                                    out = out[0]
-                                
-                                if sampling_method == 'ngd':
+                                if sampling_method == 'gd':
+                                    out = model_fn(xt, t, y, args.cfg_scale) if use_cfg else model_fn(xt, t, y)
+                                    if not torch.is_tensor(out):
+                                        out = out[0]
+                                elif sampling_method == 'ngd':
                                     x_ = xt + stepsize * m * mu
-                                    if args.cfg_scale > 1.0:
-                                        x_in = torch.cat([x_, x_], 0)
-                                        out = model_fn(x_in, t_in, y_in, args.cfg_scale)
-                                    else:
-                                        out = model_fn(x_, t, sample_y)
-                                    
+                                    out = model_fn(x_, t, y, args.cfg_scale) if use_cfg else model_fn(x_, t, y)
                                     if not torch.is_tensor(out):
                                         out = out[0]
                                     m = out
                                 
                                 xt = xt + out * stepsize
                                 t += stepsize
+                            
+                            # Extract first half after sampling completes (reference implementation approach)
+                            if use_cfg:
+                                xt, _ = xt.chunk(2, dim=0)
                             
                             samples = xt
                     else:
