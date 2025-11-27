@@ -14,4 +14,4 @@ datasets
 # Or for stable: pip install torchao
 
 prodigyopt
-lejepa
+git+https://github.com/rbalestr-lab/lejepa.git
