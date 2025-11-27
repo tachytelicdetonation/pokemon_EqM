@@ -1,5 +1,6 @@
 {
     "model": "EqM-S/2",
+    "device": "mps",
     "image_size": 64,
     "batch_size": 4,
     "epochs": 1,

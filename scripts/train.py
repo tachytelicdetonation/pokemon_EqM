@@ -192,12 +192,26 @@ def main(args):
     Trains a new EqM model.
     """
     # Setup Device
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
+    # Setup Device
+    device_name = getattr(args, "device", None)
+    if device_name:
+        if device_name == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA requested via config/args but not available.")
+            device = torch.device("cuda")
+        elif device_name == "mps":
+            if not torch.backends.mps.is_available():
+                raise RuntimeError("MPS requested via config/args but not available.")
+            device = torch.device("mps")
+        else:
+            device = torch.device(device_name)
     else:
-        device = torch.device("cpu")
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
     print(f"Using device: {device}")
 
     # Set seed
@@ -460,6 +474,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to JSON config file")
     parser.add_argument("--run-id", type=str, default=None, help="WandB run ID for resuming")
+    parser.add_argument("--device", type=str, default=None, help="Device to use (cuda, mps, cpu)")
     args = parser.parse_args()
     
     # Load config from JSON

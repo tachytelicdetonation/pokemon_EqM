@@ -1,5 +1,6 @@
 {
   "model": "EqM-B/2",
+  "device": "cuda",
   "image_size": 256,
   "batch_size": 32,
   "epochs": 80,
