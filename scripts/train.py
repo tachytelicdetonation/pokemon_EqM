@@ -269,7 +269,14 @@ def main(args):
     # Note that parameter initialization is done within the EqM constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     import prodigyopt
-    opt = prodigyopt.Prodigy(model.parameters(), lr=1.0, weight_decay=0, safeguard_warmup=True)
+    opt = prodigyopt.Prodigy(
+        model.parameters(),
+        lr=1.0,
+        weight_decay=0.01,           # recommended for diffusion models
+        safeguard_warmup=True,
+        use_bias_correction=True,    # recommended for diffusion models
+        betas=(0.9, 0.99)            # helps with diffusion training
+    )
 
     # Setup AMP
     mixed_precision = getattr(args, "mixed_precision", "no")
