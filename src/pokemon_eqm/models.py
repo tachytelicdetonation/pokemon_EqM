@@ -488,6 +488,7 @@ class EqM(nn.Module):
         liere_pos_embed_shift=None,
         liere_pos_embed_jitter=None,
         liere_pos_embed_rescale=2.0,
+        num_registers=0,  # Number of register tokens (attention sinks)
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -502,6 +503,11 @@ class EqM(nn.Module):
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+        # Register tokens (attention sinks) - from "Vision Transformers Need Registers"
+        self.num_registers = num_registers
+        if num_registers > 0:
+            self.register_tokens = nn.Parameter(torch.zeros(1, num_registers, hidden_size))
 
         block_kwargs = dict(
             use_liere=use_liere,
@@ -541,6 +547,10 @@ class EqM(nn.Module):
         # Initialize label embedding table:
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
+        # Initialize register tokens:
+        if self.num_registers > 0:
+            nn.init.normal_(self.register_tokens, std=0.02)
+
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
@@ -571,24 +581,38 @@ class EqM(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x0, t, y, return_act=False, get_energy=False, train=False):
+    def forward(self, x0, t, y, return_act=False, return_registers=False, get_energy=False, train=False):
         """
         Forward pass of EqM.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
+        return_registers: if True, also return the register token outputs for SIGReg
         """
         x0.requires_grad_(True)
         if self.uncond: # removes noise/time conditioning by setting to 0
             t = torch.zeros_like(t)
         act = []
         x = self.x_embedder(x0) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+
+        # Prepend register tokens (attention sinks)
+        if self.num_registers > 0:
+            reg_tokens = self.register_tokens.expand(x.shape[0], -1, -1)  # (N, num_reg, D)
+            x = torch.cat([reg_tokens, x], dim=1)  # (N, num_reg + T, D)
+
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
         for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
+            x = block(x, c)                      # (N, num_reg + T, D)
             act.append(x)
+
+        # Split registers from patches before final layer
+        registers = None
+        if self.num_registers > 0:
+            registers = x[:, :self.num_registers]  # (N, num_reg, D)
+            x = x[:, self.num_registers:]          # (N, T, D)
+
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         if self.learn_sigma:
@@ -599,7 +623,7 @@ class EqM(nn.Module):
         if self.ebm == 'l2':
             E = -torch.sum(x**2, dim=(1,2,3))/2
             if E.requires_grad:
-                x = torch.autograd.grad([E.sum()],[x0],create_graph=train)[0] 
+                x = torch.autograd.grad([E.sum()],[x0],create_graph=train)[0]
         if self.ebm == 'dot':
             E = torch.sum(x*x0, dim=(1,2,3))
             if E.requires_grad:
@@ -607,11 +631,15 @@ class EqM(nn.Module):
         if self.ebm == 'mean':
             E = torch.sum(x*x0, dim=(1,2,3))
             if E.requires_grad:
-                x = torch.autograd.grad([E.sum()],[x0],create_graph=train)[0]           
+                x = torch.autograd.grad([E.sum()],[x0],create_graph=train)[0]
         if get_energy:
             return x, -E
-        if return_act: 
+        if return_act:
+            if return_registers:
+                return x, act, registers
             return x, act
+        if return_registers:
+            return x, registers
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale, return_act=False, get_energy=False, train=False):

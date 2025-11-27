@@ -606,7 +606,7 @@ def main(args):
                     else:
                         imgs = vae.decode(samples / 0.18215).sample
                         
-                    imgs = torch.clamp(127.5 * imgs + 128.0, 0, 255).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+                    imgs = torch.clamp(127.5 * imgs + 128.0, 0, 255).permute(0, 2, 3, 1).detach().cpu().numpy().astype(np.uint8)
                     
                     # Save images
                     prefix_dir = f"{sample_dir}/step_{train_steps:07d}/{prefix}"
