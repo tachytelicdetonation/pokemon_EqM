@@ -36,12 +36,19 @@ import torchvision.transforms.functional as TF
 from torchvision.transforms.functional import to_pil_image
 from pathlib import Path
 import torch.nn.functional as F
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.inception import InceptionScore
 
 class CenterCrop:
     def __init__(self, image_size):
         self.image_size = image_size
     def __call__(self, pil_image):
         return center_crop_arr(pil_image, self.image_size)
+
+def pil_loader(path):
+    with open(path, 'rb') as f:
+        img = Image.open(f)
+        return img.convert('RGBA').convert('RGB')
 
 class FlatFolderDataset(Dataset):
     def __init__(self, root, transform=None):
@@ -52,7 +59,7 @@ class FlatFolderDataset(Dataset):
     def __len__(self):
         return len(self.files)
     def __getitem__(self, idx):
-        img = Image.open(self.files[idx]).convert('RGB')
+        img = pil_loader(self.files[idx])
         if self.transform:
             img = self.transform(img)
         return img, 0 # Dummy label
@@ -293,7 +300,7 @@ def main(args):
     ])
     
     try:
-        dataset = ImageFolder(args.data_path, transform=transform)
+        dataset = ImageFolder(args.data_path, transform=transform, loader=pil_loader)
     except:
         # Fallback for flat directory
         dataset = FlatFolderDataset(args.data_path, transform=transform)
@@ -307,6 +314,13 @@ def main(args):
         drop_last=True
     )
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+
+    # Initialize Metrics
+    calculate_fid = getattr(args, 'calculate_fid', False)
+    if calculate_fid:
+        fid_metric = FrechetInceptionDistance(feature=2048).to(device)
+        is_metric = InceptionScore(feature=2048).to(device)
+        logger.info("FID and IS metrics initialized.")
 
     # Prepare models for training:
     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
@@ -414,7 +428,12 @@ def main(args):
                     )
                     
                     # Create labels
-                    sample_y = torch.zeros(noise.shape[0], dtype=torch.long, device=device)
+                    if prefix == "fixed":
+                        # For fixed noise, use a fixed set of classes to see all classes
+                        sample_y = torch.arange(noise.shape[0], device=device) % args.num_classes
+                    else:
+                        # For random noise, sample random classes
+                        sample_y = torch.randint(args.num_classes, size=(noise.shape[0],), device=device)
                     
                     # CFG
                     if args.cfg_scale > 1.0:
@@ -461,6 +480,121 @@ def main(args):
                 # Random noise
                 random_noise = torch.randn_like(fixed_noise)
                 generate_and_log(random_noise, "random")
+                
+                model.train()
+
+            # FID and IS Calculation
+            if calculate_fid and train_steps % args.fid_every == 0 and train_steps > 0:
+                logger.info(f"Calculating FID and IS at step {train_steps}...")
+                model.eval()
+                
+                # 1. Generate Fake Images
+                num_fid_samples = getattr(args, 'num_fid_samples', 2000)
+                num_batches = (num_fid_samples + args.batch_size - 1) // args.batch_size
+                
+                logger.info(f"Generating {num_fid_samples} images for FID/IS...")
+                
+                fake_images_list = []
+                
+                for _ in tqdm(range(num_batches), desc="Generating FID samples"):
+                    current_batch_size = min(args.batch_size, num_fid_samples - len(fake_images_list) * args.batch_size)
+                    if current_batch_size <= 0:
+                        break
+                        
+                    noise = torch.randn(current_batch_size, 4, latent_size, latent_size, device=device)
+                    sample_y = torch.randint(args.num_classes, size=(current_batch_size,), device=device)
+                    
+                    # Use ODE sampler
+                    sampler_fn = transport_sampler.sample_ode(
+                        sampling_method="dopri5", 
+                        num_steps=50
+                    )
+                    
+                    if args.cfg_scale > 1.0:
+                        noise_in = torch.cat([noise, noise], 0)
+                        y_null = torch.tensor([args.num_classes] * current_batch_size, device=device)
+                        y_in = torch.cat([sample_y, y_null], 0)
+                        model_kwargs = dict(y=y_in, cfg_scale=args.cfg_scale)
+                        model_fn = ema.forward_with_cfg
+                    else:
+                        noise_in = noise
+                        model_kwargs = dict(y=sample_y)
+                        model_fn = ema.forward
+                    
+                    with torch.no_grad():
+                        samples = sampler_fn(noise_in, model_fn, **model_kwargs)[-1]
+                        if args.cfg_scale > 1.0:
+                            samples, _ = samples.chunk(2, dim=0)
+                        
+                        if USE_UTILS_VAE:
+                            imgs = decode_latents(vae, samples, device)
+                        else:
+                            imgs = vae.decode(samples / 0.18215).sample
+                        
+                        # Clamp and convert to uint8 [0, 255]
+                        imgs = torch.clamp(127.5 * imgs + 128.0, 0, 255).to(torch.uint8)
+                        fake_images_list.append(imgs.cpu()) # Store on CPU to save GPU memory
+
+                fake_images = torch.cat(fake_images_list, dim=0)[:num_fid_samples]
+                
+                # Update metrics with fake images
+                # torchmetrics expects [N, 3, H, W] in uint8
+                fid_metric.update(fake_images.to(device), real=False)
+                is_metric.update(fake_images.to(device))
+                
+                # 2. Get Real Images
+                logger.info(f"Processing {num_fid_samples} real images for FID...")
+                real_images_count = 0
+                # Create a separate iterator/loader for FID to avoid messing up the main training loop state if possible
+                # But reusing loader is easiest. We just iterate enough batches.
+                # Note: This might repeat images if dataset is small.
+                
+                fid_loader = DataLoader(
+                    dataset,
+                    batch_size=args.batch_size,
+                    shuffle=True,
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                    drop_last=False
+                )
+                
+                for x, _ in tqdm(fid_loader, desc="Processing real images"):
+                    # x is [0, 1] float (from ToTensor) or normalized [-1, 1] (from Normalize)
+                    # Our transform does Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) -> [-1, 1]
+                    # We need to convert back to uint8 [0, 255]
+                    
+                    x = (x * 0.5 + 0.5) * 255
+                    x = torch.clamp(x, 0, 255).to(torch.uint8)
+                    
+                    batch_size = x.shape[0]
+                    if real_images_count + batch_size > num_fid_samples:
+                        x = x[:num_fid_samples - real_images_count]
+                    
+                    fid_metric.update(x.to(device), real=True)
+                    real_images_count += x.shape[0]
+                    
+                    if real_images_count >= num_fid_samples:
+                        break
+                
+                # 3. Compute Metrics
+                logger.info("Computing FID and IS...")
+                fid_score = fid_metric.compute().item()
+                is_score, is_std = is_metric.compute()
+                is_score = is_score.item()
+                is_std = is_std.item()
+                
+                logger.info(f"FID: {fid_score:.4f}, IS: {is_score:.4f} +/- {is_std:.4f}")
+                
+                if args.wandb:
+                    wandb_utils.log({
+                        "metrics/fid": fid_score,
+                        "metrics/is": is_score,
+                        "metrics/is_std": is_std
+                    }, step=train_steps)
+                
+                # Reset metrics
+                fid_metric.reset()
+                is_metric.reset()
                 
                 model.train()
                 
