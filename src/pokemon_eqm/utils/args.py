@@ -19,11 +19,12 @@ def get_args():
     parser.add_argument("--vae-channels", type=int, default=4, help="VAE latent channels")
     
     # Sampling
-    parser.add_argument("--sampler", type=str, default="ode_dopri5", choices=["ode_dopri5", "ode_euler", "ode_heun", "gd", "ngd"], help="Sampling method")
-    parser.add_argument("--num-sampling-steps", type=int, default=50, help="Number of sampling steps")
+    parser.add_argument("--sampler", type=str, default="gd", choices=["ode_dopri5", "ode_euler", "ode_heun", "gd", "ngd"], help="Sampling method")
+    parser.add_argument("--num-sampling-steps", type=int, default=250, help="Number of sampling steps")
     parser.add_argument("--cfg-scale", type=float, default=4.0, help="Classifier-free guidance scale")
     parser.add_argument("--sample-eps", type=float, default=0.0, help="Sampling epsilon")
-    parser.add_argument("--mu", type=float, default=0.0, help="Momentum for NGD sampler")
+    parser.add_argument("--mu", type=float, default=0.3, help="Momentum for NGD sampler")
+    parser.add_argument("--stepsize", type=float, default=0.0017, help="Step size for GD/NGD sampler")
     
     # Transport
     parser.add_argument("--path-type", type=str, default="Linear", choices=["Linear", "GVP", "VP"])
@@ -32,7 +33,7 @@ def get_args():
     parser.add_argument("--train-eps", type=float, default=0.0)
     
     # Model specific
-    parser.add_argument("--uncond", action="store_true", help="Unconditional model")
+    parser.add_argument("--uncond", type=bool, default=True, help="Unconditional model")
     parser.add_argument("--energy-head", type=str, default="implicit", help="Energy head type")
     parser.add_argument("--use-rope", action="store_true", help="Use RoPE")
     parser.add_argument("--rope-base", type=float, default=10000.0, help="RoPE base")

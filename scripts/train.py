@@ -39,7 +39,6 @@ import torch.nn.functional as F
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
-from diffusers.optimization import get_cosine_schedule_with_warmup
 import math
 
 class CenterCrop:
@@ -80,7 +79,7 @@ except ImportError:
 #################################################################################
 
 @torch.no_grad()
-def update_ema(ema_model, model, decay=0.9999):
+def update_ema(ema_model, model, decay=0.999):
     """
     Step the EMA model towards the current model.
     """
@@ -270,7 +269,7 @@ def main(args):
     # Note that parameter initialization is done within the EqM constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     import prodigyopt
-    opt = prodigyopt.Prodigy(model.parameters(), lr=1.0, weight_decay=0)
+    opt = prodigyopt.Prodigy(model.parameters(), lr=1.0, weight_decay=0, safeguard_warmup=True)
 
     # Setup AMP
     mixed_precision = getattr(args, "mixed_precision", "no")
@@ -293,13 +292,6 @@ def main(args):
     
     # GradScaler is only needed for fp16
     scaler = torch.cuda.amp.GradScaler(enabled=(mixed_precision == "fp16"))
-
-    # Setup Scheduler
-    warmup_steps = getattr(args, "warmup_steps", 0)
-    # Total steps = epochs * len(loader)
-    # We need loader length first, so moving this after loader creation or calculating it now if possible.
-    # But loader is created later. Let's move loader creation up or calculate steps later.
-    # Actually, let's just create the scheduler after the loader.
 
     # Load checkpoint if provided (not via args but maybe hardcoded or future feature)
     # For now, we only support resume via manual code change or if we added it to config
@@ -348,14 +340,6 @@ def main(args):
     )
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
-    # Scheduler
-    total_steps = args.epochs * len(loader)
-    scheduler = get_cosine_schedule_with_warmup(
-        opt, 
-        num_warmup_steps=warmup_steps, 
-        num_training_steps=total_steps
-    )
-
     # Resume logic
     start_epoch = 0
     train_steps = 0
@@ -383,8 +367,6 @@ def main(args):
         opt.load_state_dict(checkpoint["opt"])
         if "scaler" in checkpoint and mixed_precision:
             scaler.load_state_dict(checkpoint["scaler"])
-        if "scheduler" in checkpoint:
-            scheduler.load_state_dict(checkpoint["scheduler"])
         train_steps = checkpoint["train_steps"]
         start_epoch = train_steps // len(loader)
         logger.info(f"Resumed at step {train_steps}, epoch {start_epoch}")
@@ -447,7 +429,6 @@ def main(args):
                 
             scaler.step(opt)
             scaler.update()
-            scheduler.step()
             update_ema(ema, model)
 
             # Log loss values:
@@ -527,8 +508,7 @@ def main(args):
                     "opt": opt.state_dict(),
                     "args": args,
                     "train_steps": train_steps,
-                    "scaler": scaler.state_dict(),
-                    "scheduler": scheduler.state_dict()
+                    "scaler": scaler.state_dict()
                 }
                 checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                 torch.save(checkpoint, checkpoint_path)
@@ -544,96 +524,136 @@ def main(args):
                 logger.info(f"Generating samples at step {train_steps}...")
                 model.eval()
                 
+
+
                 # Helper to sample and log
-                def generate_and_log(noise, prefix):
-                    # Use ODE sampler (dopri5) for better quality
-                    sampler_fn = transport_sampler.sample_ode(
-                        sampling_method="dopri5", 
-                        num_steps=50
-                    )
-                    
+                def generate_and_log(noise, prefix, sampling_method="gd", num_steps=250, stepsize=0.0017, mu=0.3):
                     # Create labels
-                    if prefix == "fixed":
-                        # For fixed noise, use a fixed set of classes to see all classes
+                    if "fixed" in prefix:
                         sample_y = torch.arange(noise.shape[0], device=device) % args.num_classes
                     else:
-                        # For random noise, sample random classes
                         sample_y = torch.randint(args.num_classes, size=(noise.shape[0],), device=device)
                     
-                    # CFG
+                    # Prepare inputs
+                    xt = noise.clone()
+                    t = torch.ones((noise.shape[0],), device=device)
+                    
                     if args.cfg_scale > 1.0:
-                        noise_in = torch.cat([noise, noise], 0)
                         y_null = torch.tensor([args.num_classes] * noise.shape[0], device=device)
                         y_in = torch.cat([sample_y, y_null], 0)
-                        
                         model_kwargs = dict(y=y_in, cfg_scale=args.cfg_scale)
                         model_fn = ema.forward_with_cfg
                     else:
-                        noise_in = noise
                         model_kwargs = dict(y=sample_y)
                         model_fn = ema.forward
-                        
-                    with torch.no_grad():
-                        samples = sampler_fn(noise_in, model_fn, **model_kwargs)[-1]
-                        if args.cfg_scale > 1.0:
-                            samples, _ = samples.chunk(2, dim=0)
-                            
-                        # Decode
-                        if USE_UTILS_VAE:
-                            imgs = decode_latents(vae, samples, device)
-                        else:
-                            imgs = vae.decode(samples / 0.18215).sample
-                            
-                        imgs = torch.clamp(127.5 * imgs + 128.0, 0, 255).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
-                        
-                        # Save images
-                        prefix_dir = f"{sample_dir}/step_{train_steps:07d}/{prefix}"
-                        os.makedirs(prefix_dir, exist_ok=True)
-                        
-                        wandb_images = []
-                        for i, img in enumerate(imgs):
-                            Image.fromarray(img).save(f"{prefix_dir}/{i:05d}.png")
-                            if i < 8:
-                                wandb_images.append(wandb_utils.wandb.Image(img, caption=f"{prefix}_{i}"))
-                        
-                        if args.wandb:
-                            wandb_utils.log({f"{prefix}/samples": wandb_images}, step=train_steps)
-                            
-                        return imgs
 
-                # Fixed noise
-                generate_and_log(fixed_noise, "fixed")
+                    # Sampling Loop (GD / NAG-GD)
+                    if sampling_method in ["gd", "ngd"]:
+                        m = torch.zeros_like(xt)
+                        with torch.no_grad():
+                            for i in range(num_steps - 1):
+                                if args.cfg_scale > 1.0:
+                                    xt_in = torch.cat([xt, xt], 0)
+                                    t_in = torch.cat([t, t], 0)
+                                    # forward_with_cfg expects (x, t, y, cfg_scale)
+                                    out = model_fn(xt_in, t_in, y_in, args.cfg_scale)
+                                else:
+                                    # forward expects (x, t, y)
+                                    out = model_fn(xt, t, sample_y)
+                                
+                                if not torch.is_tensor(out):
+                                    out = out[0]
+                                
+                                if sampling_method == 'ngd':
+                                    x_ = xt + stepsize * m * mu
+                                    if args.cfg_scale > 1.0:
+                                        x_in = torch.cat([x_, x_], 0)
+                                        out = model_fn(x_in, t_in, y_in, args.cfg_scale)
+                                    else:
+                                        out = model_fn(x_, t, sample_y)
+                                    
+                                    if not torch.is_tensor(out):
+                                        out = out[0]
+                                    m = out
+                                
+                                xt = xt + out * stepsize
+                                t += stepsize
+                            
+                            samples = xt
+                    else:
+                        # Fallback to ODE/SDE if needed (legacy)
+                        sampler_fn = transport_sampler.sample_ode(
+                            sampling_method=sampling_method, 
+                            num_steps=num_steps
+                        )
+                        if args.cfg_scale > 1.0:
+                            noise_in = torch.cat([noise, noise], 0)
+                            y_null = torch.tensor([args.num_classes] * noise.shape[0], device=device)
+                            y_in = torch.cat([sample_y, y_null], 0)
+                            model_kwargs = dict(y=y_in, cfg_scale=args.cfg_scale)
+                            model_fn = ema.forward_with_cfg
+                        else:
+                            noise_in = noise
+                            model_kwargs = dict(y=sample_y)
+                            model_fn = ema.forward
+                        
+                        with torch.no_grad():
+                            samples = sampler_fn(noise_in, model_fn, **model_kwargs)[-1]
+                            if args.cfg_scale > 1.0:
+                                samples, _ = samples.chunk(2, dim=0)
+
+                    # Decode
+                    if USE_UTILS_VAE:
+                        imgs = decode_latents(vae, samples, device)
+                    else:
+                        imgs = vae.decode(samples / 0.18215).sample
+                        
+                    imgs = torch.clamp(127.5 * imgs + 128.0, 0, 255).permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)
+                    
+                    # Save images
+                    prefix_dir = f"{sample_dir}/step_{train_steps:07d}/{prefix}"
+                    os.makedirs(prefix_dir, exist_ok=True)
+                    
+                    wandb_images = []
+                    for i, img in enumerate(imgs):
+                        Image.fromarray(img).save(f"{prefix_dir}/{i:05d}.png")
+                        if i < 8:
+                            wandb_images.append(wandb_utils.wandb.Image(img, caption=f"{prefix}_{i}"))
+                    
+                    if args.wandb:
+                        wandb_utils.log({f"{prefix}/samples": wandb_images}, step=train_steps)
+                        
+                    return imgs
+
+                # Fixed noise (Visuals - default sampler)
+                generate_and_log(fixed_noise, "fixed", "gd", 250)
                 
-                # Random noise
+                # FID Sampler Configurations
+                fid_configs = [
+                    {"method": "gd", "steps": 250, "name": "gd_250", "stepsize": 0.0017},
+                    {"method": "ngd", "steps": 250, "name": "ngd_250", "stepsize": 0.0017, "mu": 0.3},
+                ]
+
+                # Generate random noise once for fair comparison
                 random_noise = torch.randn_like(fixed_noise)
-                fake_imgs_np = generate_and_log(random_noise, "random")
                 
-                # FID and IS Calculation (using the random samples)
+                # Pre-load real images for FID if needed
+                real_images_tensor = None
                 if calculate_fid:
-                    logger.info(f"Calculating FID and IS at step {train_steps} using {len(fake_imgs_np)} samples...")
-                    
-                    # Convert numpy uint8 [N, H, W, 3] -> tensor uint8 [N, 3, H, W]
-                    fake_imgs = torch.from_numpy(fake_imgs_np).permute(0, 3, 1, 2).to(device)
-                    
-                    # Update metrics with fake images
-                    fid_metric.update(fake_imgs, real=False)
-                    is_metric.update(fake_imgs)
-                    
-                    # Get Real Images (same amount as fake)
-                    num_fid_samples = fake_imgs.shape[0]
-                    logger.info(f"Processing {num_fid_samples} real images for FID...")
-                    
-                    # Create a temporary loader for one batch
-                    fid_loader = DataLoader(
-                        dataset,
-                        batch_size=num_fid_samples, # Try to get exact amount
-                        shuffle=True,
-                        num_workers=0, # Avoid overhead
-                        drop_last=False
-                    )
-                    
-                    # Get one batch
                     try:
+                        num_fid_samples = random_noise.shape[0]
+                        logger.info(f"Processing {num_fid_samples} real images for FID...")
+                        
+                        # Create a temporary loader for one batch
+                        fid_loader = DataLoader(
+                            dataset,
+                            batch_size=num_fid_samples, 
+                            shuffle=True,
+                            num_workers=0, 
+                            drop_last=False
+                        )
+                        
+                        # Get one batch
                         x, _ = next(iter(fid_loader))
                         # Transform to uint8 [0, 255]
                         x = (x * 0.5 + 0.5) * 255
@@ -641,47 +661,74 @@ def main(args):
                         
                         if x.shape[0] > num_fid_samples:
                             x = x[:num_fid_samples]
-                            
-                        fid_metric.update(x.to(device), real=True)
                         
-                        # Compute Metrics
-                        logger.info("Computing FID and IS...")
-                        fid_score = fid_metric.compute().item()
-                        is_score, is_std = is_metric.compute()
-                        is_score = is_score.item()
-                        is_std = is_std.item()
-                        
-                        logger.info(f"FID: {fid_score:.4f}, IS: {is_score:.4f} +/- {is_std:.4f}")
-                        
-                        if args.wandb:
-                            wandb_utils.log({
-                                "metrics/fid": fid_score,
-                                "metrics/is": is_score,
-                                "metrics/is_std": is_std
-                            }, step=train_steps)
-                        
-                        # Save best FID
-                        if fid_score < best_fid:
-                            best_fid = fid_score
-                            checkpoint = {
-                                "model": model.state_dict(),
-                                "ema": ema.state_dict(),
-                                "opt": opt.state_dict(),
-                                "args": args,
-                                "train_steps": train_steps,
-                                "scaler": scaler.state_dict(),
-                                "scheduler": scheduler.state_dict(),
-                                "fid": fid_score
-                            }
-                            torch.save(checkpoint, f"{checkpoint_dir}/best_fid.pt")
-                            logger.info(f"New best FID: {best_fid:.4f}. Saved to best_fid.pt")
-                            
+                        real_images_tensor = x.to(device)
                     except Exception as e:
-                        logger.warning(f"Failed to calculate FID: {e}")
+                        logger.warning(f"Failed to load real images for FID: {e}")
+
+                # Loop over samplers
+                for config in fid_configs:
+                    method = config["method"]
+                    steps = config["steps"]
+                    name = config["name"]
                     
-                    # Reset metrics
-                    fid_metric.reset()
-                    is_metric.reset()
+                    stepsize = config.get("stepsize", 0.0017)
+                    mu = config.get("mu", 0.3)
+                    
+                    logger.info(f"Generating samples for {name} ({method}, {steps} steps)...")
+                    fake_imgs_np = generate_and_log(random_noise, f"random_{name}", method, steps, stepsize, mu)
+                    
+                    # FID and IS Calculation
+                    if calculate_fid and real_images_tensor is not None:
+                        logger.info(f"Calculating FID and IS for {name}...")
+                        
+                        try:
+                            # Convert numpy uint8 [N, H, W, 3] -> tensor uint8 [N, 3, H, W]
+                            fake_imgs = torch.from_numpy(fake_imgs_np).permute(0, 3, 1, 2).to(device)
+                            
+                            # Update metrics
+                            fid_metric.update(fake_imgs, real=False)
+                            is_metric.update(fake_imgs)
+                            
+                            # Update with real images
+                            fid_metric.update(real_images_tensor, real=True)
+                            
+                            # Compute Metrics
+                            fid_score = fid_metric.compute().item()
+                            is_score, is_std = is_metric.compute()
+                            is_score = is_score.item()
+                            is_std = is_std.item()
+                            
+                            logger.info(f"[{name}] FID: {fid_score:.4f}, IS: {is_score:.4f} +/- {is_std:.4f}")
+                            
+                            if args.wandb:
+                                wandb_utils.log({
+                                    f"metrics/fid_{name}": fid_score,
+                                    f"metrics/is_{name}": is_score,
+                                    f"metrics/is_std_{name}": is_std
+                                }, step=train_steps)
+                            
+                            # Save best FID (only for default gd_250)
+                            if name == "gd_250" and fid_score < best_fid:
+                                best_fid = fid_score
+                                checkpoint = {
+                                    "model": model.state_dict(),
+                                    "ema": ema.state_dict(),
+                                    "opt": opt.state_dict(),
+                                 "args": args,
+                                 "train_steps": train_steps,
+                                 "scaler": scaler.state_dict(),
+                                 "fid": fid_score
+                                }
+                                torch.save(checkpoint, f"{checkpoint_dir}/best_fid.pt")
+                                logger.info(f"New best FID: {best_fid:.4f}. Saved to best_fid.pt")
+                                
+                        except Exception as e:
+                            logger.warning(f"Failed to calculate FID for {name}: {e}")
+                        
+                        # Reset metrics
+                        fid_metric.reset()
+                        is_metric.reset()
                 
                 model.train()
                 

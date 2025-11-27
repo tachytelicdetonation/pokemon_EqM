@@ -193,21 +193,7 @@ def sample_pokemon(model, vae, args, device, num_samples=None, output_dir=None, 
                     mem_reserved = torch.cuda.memory_reserved(device) / 1e9
                     print(f"    GPU mem: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
 
-            # Final corrective step to land exactly at t=1 (prevents under-integration when stepsize is small).
-            remaining = (1.0 - t).clamp(min=0.0)
-            print(f"\nFinal corrective step:")
-            print(f"  remaining: max={remaining.max().item():.6f}, mean={remaining.mean().item():.6f}")
-            if remaining.max() > 1e-6:
-                print(f"  Applying final correction, forward pass at t={t[0].item():.6f}")
-                out_obj = model_forward(xt, t)
-                out_final = out_obj[0] if isinstance(out_obj, tuple) else out_obj
-                print(f"  Final output norm: {out_final.norm().item():.4f}")
-                xt = xt + out_final * remaining.view(-1, 1, 1, 1)
-                t = torch.ones_like(t)
-                step_counts += (remaining > 0).int()
-                print(f"  Final xt norm: {xt.norm().item():.4f}, t[0]={t[0].item():.6f}")
-            else:
-                print(f"  No correction needed (remaining < 1e-6)")
+
 
             print(f"\nSampling complete! Total steps taken: {step_counts[0].item()}")
             print(f"Average step time: {sum(step_times)/len(step_times):.3f}s")
