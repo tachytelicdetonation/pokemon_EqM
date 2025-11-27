@@ -37,8 +37,6 @@ from torchvision.transforms.functional import to_pil_image
 from pathlib import Path
 import torch.nn.functional as F
 from torchmetrics.image.fid import FrechetInceptionDistance
-from torchmetrics.image.fid import FrechetInceptionDistance
-from torchmetrics.image.inception import InceptionScore
 import math
 
 class CenterCrop:
@@ -382,8 +380,7 @@ def main(args):
     calculate_fid = getattr(args, 'calculate_fid', False)
     if calculate_fid:
         fid_metric = FrechetInceptionDistance(feature=2048).to(device)
-        is_metric = InceptionScore(feature=2048).to(device)
-        logger.info("FID and IS metrics initialized.")
+        logger.info("FID metric initialized.")
 
     # Prepare models for training:
     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
@@ -687,32 +684,26 @@ def main(args):
                     
                     # FID and IS Calculation
                     if calculate_fid and real_images_tensor is not None:
-                        logger.info(f"Calculating FID and IS for {name}...")
-                        
+                        logger.info(f"Calculating FID for {name}...")
+
                         try:
                             # Convert numpy uint8 [N, H, W, 3] -> tensor uint8 [N, 3, H, W]
                             fake_imgs = torch.from_numpy(fake_imgs_np).permute(0, 3, 1, 2).to(device)
-                            
+
                             # Update metrics
                             fid_metric.update(fake_imgs, real=False)
-                            is_metric.update(fake_imgs)
-                            
+
                             # Update with real images
                             fid_metric.update(real_images_tensor, real=True)
-                            
-                            # Compute Metrics
+
+                            # Compute FID
                             fid_score = fid_metric.compute().item()
-                            is_score, is_std = is_metric.compute()
-                            is_score = is_score.item()
-                            is_std = is_std.item()
-                            
-                            logger.info(f"[{name}] FID: {fid_score:.4f}, IS: {is_score:.4f} +/- {is_std:.4f}")
-                            
+
+                            logger.info(f"[{name}] FID: {fid_score:.4f}")
+
                             if args.wandb:
                                 wandb_utils.log({
                                     f"metrics/fid_{name}": fid_score,
-                                    f"metrics/is_{name}": is_score,
-                                    f"metrics/is_std_{name}": is_std
                                 }, step=train_steps)
                             
                             # Save best FID (only for default gd_250)
@@ -735,7 +726,6 @@ def main(args):
                         
                         # Reset metrics
                         fid_metric.reset()
-                        is_metric.reset()
                 
                 model.train()
                 
