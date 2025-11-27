@@ -9,6 +9,14 @@ from . import path
 from .utils import EasyDict, log_state, mean_flat
 from .integrators import ode, sde
 
+# SIGReg support from LeJEPA
+try:
+    import lejepa
+    LEJEPA_AVAILABLE = True
+except ImportError:
+    LEJEPA_AVAILABLE = False
+    logging.warning("lejepa package not installed. SIGReg loss will be unavailable.")
+
 class ModelType(enum.Enum):
     """
     Which type of output the model predicts.
@@ -47,6 +55,11 @@ class Transport:
         loss_type,
         train_eps,
         sample_eps,
+        # SIGReg parameters
+        use_sigreg=False,
+        sigreg_lambda=0.05,
+        sigreg_num_slices=1024,
+        sigreg_num_points=17,
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -59,6 +72,17 @@ class Transport:
         self.path_sampler = path_options[path_type]()
         self.train_eps = train_eps
         self.sample_eps = sample_eps
+
+        # SIGReg initialization
+        self.use_sigreg = use_sigreg and LEJEPA_AVAILABLE
+        self.sigreg_lambda = sigreg_lambda
+        if self.use_sigreg:
+            univariate_test = lejepa.univariate.EppsPulley(num_points=sigreg_num_points)
+            self.sigreg_loss_fn = lejepa.multivariate.SlicingUnivariateTest(
+                univariate_test=univariate_test,
+                num_slices=sigreg_num_slices
+            )
+            logging.info(f"SIGReg initialized with lambda={sigreg_lambda}, slices={sigreg_num_slices}, points={sigreg_num_points}")
 
     def prior_logp(self, z):
         '''
@@ -119,6 +143,28 @@ class Transport:
         diff = th.concat((diff, diff, th.zeros(z.shape[0]).cuda()))  # match JAX implementation of full BxB matrix
         return th.log(th.exp(-diff).mean())
 
+    def sigreg_loss(self, registers):
+        """
+        Compute SIGReg loss on register tokens.
+
+        SIGReg (Sketched Isotropic Gaussian Regularization) encourages the
+        register token embeddings to follow an isotropic Gaussian distribution.
+
+        Args:
+            registers: Tensor of shape [N, num_registers, D] from the model
+
+        Returns:
+            Scalar loss value
+        """
+        if not self.use_sigreg or registers is None:
+            return 0.0
+
+        # Mean pool over registers: [N, num_reg, D] -> [N, D]
+        embeddings = registers.mean(dim=1)
+
+        # Apply SIGReg loss
+        return self.sigreg_loss_fn(embeddings)
+
     def get_ct(self, t): #ct implementation
         interp = 0.8
         start = 1.0
@@ -126,9 +172,9 @@ class Transport:
         return ct
 
     def training_losses(
-        self, 
-        model,  
-        x1, 
+        self,
+        model,
+        x1,
         model_kwargs=None
     ):
         """Loss for training the score model
@@ -137,20 +183,35 @@ class Transport:
         - x1: datapoint
         - model_kwargs: additional arguments for the model
         """
-        if model_kwargs == None: 
+        if model_kwargs == None:
             model_kwargs = {}
-        
+
+        # Request registers if SIGReg is enabled
+        if self.use_sigreg:
+            model_kwargs['return_registers'] = True
+
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         ut = ut * self.get_ct(t)[:,None,None,None] # use energy-compatible target
         model_output = model(xt, t, **model_kwargs)
         disp_loss = 0
+        sigreg_loss_value = 0
+        registers = None
 
         # get intermediate activation and apply Dispersive Loss
         if "return_act" in model_kwargs and model_kwargs['return_act']:
-            model_output, act = model_output
+            if self.use_sigreg:
+                model_output, act, registers = model_output
+            else:
+                model_output, act = model_output
             disp_loss = self.disp_loss(act[len(act)-1])
-        
+        elif self.use_sigreg:
+            model_output, registers = model_output
+
+        # Compute SIGReg loss on register tokens
+        if self.use_sigreg and registers is not None:
+            sigreg_loss_value = self.sigreg_loss(registers)
+
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
 
@@ -158,7 +219,7 @@ class Transport:
         terms['pred'] = model_output
         if self.model_type == ModelType.VELOCITY:
             terms['loss'] = mean_flat(((model_output - ut) ** 2))
-        else: 
+        else:
             _, drift_var = self.path_sampler.compute_drift(xt, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, xt))
             if self.loss_type in [WeightType.VELOCITY]:
@@ -169,12 +230,16 @@ class Transport:
                 weight = 1
             else:
                 raise NotImplementedError()
-            
+
             if self.model_type == ModelType.NOISE:
                 terms['loss'] = mean_flat(weight * ((model_output - x0) ** 2))
             else:
                 terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
-        terms['loss'] += 0.5*disp_loss      
+
+        # Add auxiliary losses
+        terms['loss'] += 0.5 * disp_loss + self.sigreg_lambda * sigreg_loss_value
+        terms['disp_loss'] = disp_loss
+        terms['sigreg_loss'] = sigreg_loss_value
         return terms
     
 

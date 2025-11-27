@@ -261,7 +261,8 @@ def main(args):
         liere_jitter_mode=getattr(args, 'liere_jitter_mode', 'gaussian'),
         liere_pos_embed_shift=getattr(args, 'liere_pos_embed_shift', None),
         liere_pos_embed_jitter=getattr(args, 'liere_pos_embed_jitter', None),
-        liere_pos_embed_rescale=getattr(args, 'liere_pos_embed_rescale', 2.0)
+        liere_pos_embed_rescale=getattr(args, 'liere_pos_embed_rescale', 2.0),
+        num_registers=getattr(args, 'num_registers', 0),  # Register tokens for attention sinks
     ).to(device)
 
     # Note that parameter initialization is done within the EqM constructor
@@ -309,7 +310,12 @@ def main(args):
         args.prediction,
         args.loss_weight,
         args.train_eps,
-        args.sample_eps
+        args.sample_eps,
+        # SIGReg parameters
+        use_sigreg=getattr(args, 'use_sigreg', False),
+        sigreg_lambda=getattr(args, 'sigreg_lambda', 0.05),
+        sigreg_num_slices=getattr(args, 'sigreg_num_slices', 1024),
+        sigreg_num_points=getattr(args, 'sigreg_num_points', 17),
     )  # default: velocity; 
     transport_sampler = Sampler(transport)
     
@@ -474,7 +480,7 @@ def main(args):
 
             # Log to wandb every step
             if args.wandb:
-                wandb_utils.log({
+                log_dict = {
                     "train/loss": loss.item(),
                     "grad/gsnr": grad_stats["gsnr"],
                     "grad/norm": grad_stats["total_norm"],
@@ -483,7 +489,15 @@ def main(args):
                     "train/lr": opt.param_groups[0]["lr"],
                     "train/scale": scaler.get_scale(),
                     "train/steps_per_sec": current_steps_per_sec
-                }, step=train_steps)
+                }
+                # Add SIGReg loss if available
+                if 'sigreg_loss' in loss_dict:
+                    sigreg_val = loss_dict['sigreg_loss']
+                    log_dict["train/sigreg_loss"] = sigreg_val.item() if torch.is_tensor(sigreg_val) else sigreg_val
+                if 'disp_loss' in loss_dict:
+                    disp_val = loss_dict['disp_loss']
+                    log_dict["train/disp_loss"] = disp_val.item() if torch.is_tensor(disp_val) else disp_val
+                wandb_utils.log(log_dict, step=train_steps)
 
             if train_steps % args.log_every == 0:
                 # Measure training speed (averaged):

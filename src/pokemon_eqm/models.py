@@ -642,25 +642,34 @@ class EqM(nn.Module):
             return x, registers
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale, return_act=False, get_energy=False, train=False):
+    def forward_with_cfg(self, x, t, y, cfg_scale, return_act=False, return_registers=False, get_energy=False, train=False):
         """
         Forward pass of EqM, but also batches the uncondional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y, return_act=return_act, get_energy=get_energy, train=train)
+        model_out = self.forward(combined, t, y, return_act=return_act, return_registers=return_registers, get_energy=get_energy, train=train)
+
+        registers = None
         if get_energy:
             x, E = model_out
-            model_out=x
+            model_out = x
         if return_act:
-            act = model_out[1]
-            model_out = model_out[0]
+            if return_registers:
+                model_out, act, registers = model_out
+            else:
+                model_out, act = model_out
             eps, rest = model_out[:, :3], model_out[:, 3:]
             cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
             half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
             eps = torch.cat([half_eps, half_eps], dim=0)
+            if return_registers:
+                return torch.cat([eps, rest], dim=1), act, registers
             return torch.cat([eps, rest], dim=1), act
+        elif return_registers:
+            model_out, registers = model_out
+
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
@@ -671,6 +680,8 @@ class EqM(nn.Module):
         eps = torch.cat([half_eps, half_eps], dim=0)
         if get_energy:
             return torch.cat([eps, rest], dim=1), E
+        if return_registers:
+            return torch.cat([eps, rest], dim=1), registers
         return torch.cat([eps, rest], dim=1)
 
 

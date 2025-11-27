@@ -35,5 +35,10 @@
   "fid_every": 2000,
   "num_fid_samples": 2000,
   "warmup_steps": 1000,
-  "mixed_precision": "bf16"
+  "mixed_precision": "bf16",
+  "num_registers": 4,
+  "use_sigreg": true,
+  "sigreg_lambda": 0.05,
+  "sigreg_num_slices": 1024,
+  "sigreg_num_points": 17
 }
