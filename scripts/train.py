@@ -315,7 +315,6 @@ def main(args):
         use_sigreg=getattr(args, 'use_sigreg', False),
         sigreg_lambda=getattr(args, 'sigreg_lambda', 0.05),
         sigreg_num_slices=getattr(args, 'sigreg_num_slices', 1024),
-        sigreg_num_points=getattr(args, 'sigreg_num_points', 17),
     )  # default: velocity; 
     transport_sampler = Sampler(transport)
     

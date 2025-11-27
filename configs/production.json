@@ -39,6 +39,5 @@
   "num_registers": 4,
   "use_sigreg": true,
   "sigreg_lambda": 0.05,
-  "sigreg_num_slices": 1024,
-  "sigreg_num_points": 17
+  "sigreg_num_slices": 1024
 }

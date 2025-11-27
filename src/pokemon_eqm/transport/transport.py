@@ -59,7 +59,6 @@ class Transport:
         use_sigreg=False,
         sigreg_lambda=0.05,
         sigreg_num_slices=1024,
-        sigreg_num_points=17,
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -77,12 +76,12 @@ class Transport:
         self.use_sigreg = use_sigreg and LEJEPA_AVAILABLE
         self.sigreg_lambda = sigreg_lambda
         if self.use_sigreg:
-            univariate_test = lejepa.univariate.EppsPulley(num_points=sigreg_num_points)
+            univariate_test = lejepa.univariate.EppsPulley()
             self.sigreg_loss_fn = lejepa.multivariate.SlicingUnivariateTest(
                 univariate_test=univariate_test,
                 num_slices=sigreg_num_slices
             )
-            logging.info(f"SIGReg initialized with lambda={sigreg_lambda}, slices={sigreg_num_slices}, points={sigreg_num_points}")
+            logging.info(f"SIGReg initialized with lambda={sigreg_lambda}, slices={sigreg_num_slices}")
 
     def prior_logp(self, z):
         '''
@@ -145,25 +144,35 @@ class Transport:
 
     def sigreg_loss(self, registers):
         """
-        Compute SIGReg loss on register tokens.
+        Compute SIGReg loss on register tokens (LeJEPA-style).
 
-        SIGReg (Sketched Isotropic Gaussian Regularization) encourages the
-        register token embeddings to follow an isotropic Gaussian distribution.
+        Following LeJEPA, we treat each register position as a separate "view"
+        and apply SIGReg independently to each, then average. This encourages
+        each register to independently follow an isotropic Gaussian distribution.
+
+        Input shape: [N, num_registers, D]
+        Reshaped to: [num_registers, N, D] (registers as views)
+        Each view [N, D] is regularized independently.
 
         Args:
             registers: Tensor of shape [N, num_registers, D] from the model
 
         Returns:
-            Scalar loss value
+            Scalar loss value (averaged across register positions)
         """
         if not self.use_sigreg or registers is None:
             return 0.0
 
-        # Mean pool over registers: [N, num_reg, D] -> [N, D]
-        embeddings = registers.mean(dim=1)
+        # Reshape: [N, num_reg, D] -> [num_reg, N, D] (treat registers as views)
+        registers = registers.permute(1, 0, 2)  # [num_reg, N, D]
 
-        # Apply SIGReg loss
-        return self.sigreg_loss_fn(embeddings)
+        # Apply SIGReg to each register position and average
+        total_loss = 0.0
+        num_registers = registers.shape[0]
+        for i in range(num_registers):
+            total_loss = total_loss + self.sigreg_loss_fn(registers[i])  # [N, D]
+
+        return total_loss / num_registers
 
     def get_ct(self, t): #ct implementation
         interp = 0.8

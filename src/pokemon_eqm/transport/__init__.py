@@ -10,7 +10,6 @@ def create_transport(
     use_sigreg=False,
     sigreg_lambda=0.05,
     sigreg_num_slices=1024,
-    sigreg_num_points=17,
 ):
     """function for creating Transport object
     **Note**: model prediction defaults to velocity
@@ -25,7 +24,6 @@ def create_transport(
     - use_sigreg: enable SIGReg loss on register tokens
     - sigreg_lambda: weight for SIGReg loss (default 0.05)
     - sigreg_num_slices: number of random projections for SIGReg (default 1024)
-    - sigreg_num_points: number of points for Epps-Pulley test (default 17)
     """
 
     if prediction == "noise":
@@ -70,7 +68,6 @@ def create_transport(
         use_sigreg=use_sigreg,
         sigreg_lambda=sigreg_lambda,
         sigreg_num_slices=sigreg_num_slices,
-        sigreg_num_points=sigreg_num_points,
     )
 
     return state
