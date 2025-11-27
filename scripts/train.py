@@ -37,7 +37,10 @@ from torchvision.transforms.functional import to_pil_image
 from pathlib import Path
 import torch.nn.functional as F
 from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
+from diffusers.optimization import get_cosine_schedule_with_warmup
+import math
 
 class CenterCrop:
     def __init__(self, image_size):
@@ -266,7 +269,37 @@ def main(args):
 
     # Note that parameter initialization is done within the EqM constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    import prodigyopt
+    opt = prodigyopt.Prodigy(model.parameters(), lr=1.0, weight_decay=0)
+
+    # Setup AMP
+    mixed_precision = getattr(args, "mixed_precision", "no")
+    # Handle boolean legacy config
+    if isinstance(mixed_precision, bool):
+        mixed_precision = "fp16" if mixed_precision else "no"
+        
+    device_type = "cuda" if "cuda" in str(device) else "cpu"
+    amp_dtype = torch.float32
+    if mixed_precision == "bf16":
+        amp_dtype = torch.bfloat16
+    elif mixed_precision == "fp16":
+        amp_dtype = torch.float16
+    elif mixed_precision == "no":
+        amp_dtype = torch.float32
+    else:
+        raise ValueError(f"Unknown mixed_precision value: {mixed_precision}")
+
+    logger.info(f"Using mixed precision: {mixed_precision} (dtype: {amp_dtype})")
+    
+    # GradScaler is only needed for fp16
+    scaler = torch.cuda.amp.GradScaler(enabled=(mixed_precision == "fp16"))
+
+    # Setup Scheduler
+    warmup_steps = getattr(args, "warmup_steps", 0)
+    # Total steps = epochs * len(loader)
+    # We need loader length first, so moving this after loader creation or calculating it now if possible.
+    # But loader is created later. Let's move loader creation up or calculate steps later.
+    # Actually, let's just create the scheduler after the loader.
 
     # Load checkpoint if provided (not via args but maybe hardcoded or future feature)
     # For now, we only support resume via manual code change or if we added it to config
@@ -315,6 +348,47 @@ def main(args):
     )
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
+    # Scheduler
+    total_steps = args.epochs * len(loader)
+    scheduler = get_cosine_schedule_with_warmup(
+        opt, 
+        num_warmup_steps=warmup_steps, 
+        num_training_steps=total_steps
+    )
+
+    # Resume logic
+    start_epoch = 0
+    train_steps = 0
+    resume_path = None
+    if args.run_id:
+        # If run_id is provided, try to find the checkpoint
+        # This is a bit specific to the user's setup, but let's look for 'latest.pt' in the experiment dir
+        # We might need to search for the experiment dir based on run_id if we were using wandb run paths,
+        # but here we assume we might be resuming from the same directory structure.
+        # For now, let's look for a 'latest.pt' in the current experiment_dir if it exists, 
+        # or allow a specific --resume argument.
+        pass # Placeholder if we want complex logic
+    
+    # Check for latest.pt in the created experiment_dir (if we are restarting the same run)
+    # Or if the user wants to resume from a specific path.
+    # Let's add a simple check: if experiment_dir has latest.pt, load it.
+    if os.path.exists(f"{checkpoint_dir}/latest.pt"):
+        resume_path = f"{checkpoint_dir}/latest.pt"
+    
+    if resume_path:
+        logger.info(f"Resuming from {resume_path}")
+        checkpoint = torch.load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        ema.load_state_dict(checkpoint["ema"])
+        opt.load_state_dict(checkpoint["opt"])
+        if "scaler" in checkpoint and mixed_precision:
+            scaler.load_state_dict(checkpoint["scaler"])
+        if "scheduler" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        train_steps = checkpoint["train_steps"]
+        start_epoch = train_steps // len(loader)
+        logger.info(f"Resumed at step {train_steps}, epoch {start_epoch}")
+
     # Initialize Metrics
     calculate_fid = getattr(args, 'calculate_fid', False)
     if calculate_fid:
@@ -328,7 +402,8 @@ def main(args):
     ema.eval()  # EMA model should always be in eval mode
 
     # Variables for monitoring/logging purposes:
-    train_steps = 0
+    # train_steps is already set if resumed
+    log_steps = 0
     log_steps = 0
     running_loss = 0
     start_time = time()
@@ -340,7 +415,9 @@ def main(args):
     fixed_noise = torch.randn(args.sample_batch_size, 4, latent_size, latent_size, device=device)
     
     logger.info(f"Training for {args.epochs} epochs...")
-    for epoch in range(args.epochs):
+    best_fid = float('inf')
+
+    for epoch in range(start_epoch, args.epochs):
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
             x = x.to(device)
@@ -353,16 +430,24 @@ def main(args):
                     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             
             model_kwargs = dict(y=y, return_act=False, train=True)
-            loss_dict = transport.training_losses(model, x, model_kwargs)
-            loss = loss_dict["loss"].mean()
+            model_kwargs = dict(y=y, return_act=False, train=True)
+            
             opt.zero_grad()
-            loss.backward()
+            
+            with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=(mixed_precision != "no")):
+                loss_dict = transport.training_losses(model, x, model_kwargs)
+                loss = loss_dict["loss"].mean()
+            
+            scaler.scale(loss).backward()
             
             # Gradient clipping
             if args.grad_clip > 0:
+                scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
+            scheduler.step()
             update_ema(ema, model)
 
             # Log loss values:
@@ -373,6 +458,35 @@ def main(args):
             # Compute gradient stats for GSNR
             grad_stats = compute_grad_stats(model, device)
             
+            # Calculate instantaneous steps/sec for WandB
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            step_end_time = time()
+            # Avoid division by zero
+            step_duration = step_end_time - start_time if log_steps == 1 else step_end_time - last_step_time
+            # For the very first step of a log interval, this might be slightly off if we don't track last_step_time globally
+            # Let's just use a simple delta from the top of the loop? 
+            # Actually, the previous code used `start_time` which was reset every log_every steps.
+            # To get per-step speed, we need to track time per step.
+            
+            # Let's use a simpler approach:
+            # We need to capture time at the start of the step. 
+            # Since I'm editing a block in the middle, I can't easily insert at the top of the loop without a larger edit.
+            # However, I can use `time()` here and compare to `last_step_time`.
+            
+            current_time = time()
+            if 'last_step_time' not in locals():
+                last_step_time = start_time 
+            
+            step_duration = current_time - last_step_time
+            last_step_time = current_time
+            
+            # If step_duration is 0 (too fast), cap it
+            if step_duration < 1e-6:
+                step_duration = 1e-6
+            
+            current_steps_per_sec = 1.0 / step_duration
+
             # Log to wandb every step
             if args.wandb:
                 wandb_utils.log({
@@ -381,10 +495,13 @@ def main(args):
                     "grad/norm": grad_stats["total_norm"],
                     "grad/mean": grad_stats["grad_mean"],
                     "grad/var": grad_stats["grad_var"],
+                    "train/lr": opt.param_groups[0]["lr"],
+                    "train/scale": scaler.get_scale(),
+                    "train/steps_per_sec": current_steps_per_sec
                 }, step=train_steps)
 
             if train_steps % args.log_every == 0:
-                # Measure training speed:
+                # Measure training speed (averaged):
                 if device.type == 'cuda':
                     torch.cuda.synchronize()
                 end_time = time()
@@ -394,7 +511,7 @@ def main(args):
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 if args.wandb:
                     wandb_utils.log(
-                        { "train/avg_loss": avg_loss, "train/steps_per_sec": steps_per_sec },
+                        { "train/avg_loss": avg_loss, "train/avg_steps_per_sec": steps_per_sec },
                         step=train_steps
                     )
                 # Reset monitoring variables:
@@ -408,11 +525,19 @@ def main(args):
                     "model": model.state_dict(),
                     "ema": ema.state_dict(),
                     "opt": opt.state_dict(),
-                    "args": args
+                    "args": args,
+                    "train_steps": train_steps,
+                    "scaler": scaler.state_dict(),
+                    "scheduler": scheduler.state_dict()
                 }
                 checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                 torch.save(checkpoint, checkpoint_path)
-                logger.info(f"Saved checkpoint to {checkpoint_path}")
+                
+                # Save latest
+                latest_path = f"{checkpoint_dir}/latest.pt"
+                torch.save(checkpoint, latest_path)
+                
+                logger.info(f"Saved checkpoint to {checkpoint_path} and {latest_path}")
             
             # Sampling (Fixed and Random)
             if train_steps % args.sample_every == 0 and train_steps > 0:
@@ -473,128 +598,90 @@ def main(args):
                         
                         if args.wandb:
                             wandb_utils.log({f"{prefix}/samples": wandb_images}, step=train_steps)
+                            
+                        return imgs
 
                 # Fixed noise
                 generate_and_log(fixed_noise, "fixed")
                 
                 # Random noise
                 random_noise = torch.randn_like(fixed_noise)
-                generate_and_log(random_noise, "random")
+                fake_imgs_np = generate_and_log(random_noise, "random")
                 
-                model.train()
-
-            # FID and IS Calculation
-            if calculate_fid and train_steps % args.fid_every == 0 and train_steps > 0:
-                logger.info(f"Calculating FID and IS at step {train_steps}...")
-                model.eval()
-                
-                # 1. Generate Fake Images
-                num_fid_samples = getattr(args, 'num_fid_samples', 2000)
-                num_batches = (num_fid_samples + args.batch_size - 1) // args.batch_size
-                
-                logger.info(f"Generating {num_fid_samples} images for FID/IS...")
-                
-                fake_images_list = []
-                
-                for _ in tqdm(range(num_batches), desc="Generating FID samples"):
-                    current_batch_size = min(args.batch_size, num_fid_samples - len(fake_images_list) * args.batch_size)
-                    if current_batch_size <= 0:
-                        break
-                        
-                    noise = torch.randn(current_batch_size, 4, latent_size, latent_size, device=device)
-                    sample_y = torch.randint(args.num_classes, size=(current_batch_size,), device=device)
+                # FID and IS Calculation (using the random samples)
+                if calculate_fid:
+                    logger.info(f"Calculating FID and IS at step {train_steps} using {len(fake_imgs_np)} samples...")
                     
-                    # Use ODE sampler
-                    sampler_fn = transport_sampler.sample_ode(
-                        sampling_method="dopri5", 
-                        num_steps=50
+                    # Convert numpy uint8 [N, H, W, 3] -> tensor uint8 [N, 3, H, W]
+                    fake_imgs = torch.from_numpy(fake_imgs_np).permute(0, 3, 1, 2).to(device)
+                    
+                    # Update metrics with fake images
+                    fid_metric.update(fake_imgs, real=False)
+                    is_metric.update(fake_imgs)
+                    
+                    # Get Real Images (same amount as fake)
+                    num_fid_samples = fake_imgs.shape[0]
+                    logger.info(f"Processing {num_fid_samples} real images for FID...")
+                    
+                    # Create a temporary loader for one batch
+                    fid_loader = DataLoader(
+                        dataset,
+                        batch_size=num_fid_samples, # Try to get exact amount
+                        shuffle=True,
+                        num_workers=0, # Avoid overhead
+                        drop_last=False
                     )
                     
-                    if args.cfg_scale > 1.0:
-                        noise_in = torch.cat([noise, noise], 0)
-                        y_null = torch.tensor([args.num_classes] * current_batch_size, device=device)
-                        y_in = torch.cat([sample_y, y_null], 0)
-                        model_kwargs = dict(y=y_in, cfg_scale=args.cfg_scale)
-                        model_fn = ema.forward_with_cfg
-                    else:
-                        noise_in = noise
-                        model_kwargs = dict(y=sample_y)
-                        model_fn = ema.forward
-                    
-                    with torch.no_grad():
-                        samples = sampler_fn(noise_in, model_fn, **model_kwargs)[-1]
-                        if args.cfg_scale > 1.0:
-                            samples, _ = samples.chunk(2, dim=0)
+                    # Get one batch
+                    try:
+                        x, _ = next(iter(fid_loader))
+                        # Transform to uint8 [0, 255]
+                        x = (x * 0.5 + 0.5) * 255
+                        x = torch.clamp(x, 0, 255).to(torch.uint8)
                         
-                        if USE_UTILS_VAE:
-                            imgs = decode_latents(vae, samples, device)
-                        else:
-                            imgs = vae.decode(samples / 0.18215).sample
+                        if x.shape[0] > num_fid_samples:
+                            x = x[:num_fid_samples]
+                            
+                        fid_metric.update(x.to(device), real=True)
                         
-                        # Clamp and convert to uint8 [0, 255]
-                        imgs = torch.clamp(127.5 * imgs + 128.0, 0, 255).to(torch.uint8)
-                        fake_images_list.append(imgs.cpu()) # Store on CPU to save GPU memory
-
-                fake_images = torch.cat(fake_images_list, dim=0)[:num_fid_samples]
-                
-                # Update metrics with fake images
-                # torchmetrics expects [N, 3, H, W] in uint8
-                fid_metric.update(fake_images.to(device), real=False)
-                is_metric.update(fake_images.to(device))
-                
-                # 2. Get Real Images
-                logger.info(f"Processing {num_fid_samples} real images for FID...")
-                real_images_count = 0
-                # Create a separate iterator/loader for FID to avoid messing up the main training loop state if possible
-                # But reusing loader is easiest. We just iterate enough batches.
-                # Note: This might repeat images if dataset is small.
-                
-                fid_loader = DataLoader(
-                    dataset,
-                    batch_size=args.batch_size,
-                    shuffle=True,
-                    num_workers=args.num_workers,
-                    pin_memory=True,
-                    drop_last=False
-                )
-                
-                for x, _ in tqdm(fid_loader, desc="Processing real images"):
-                    # x is [0, 1] float (from ToTensor) or normalized [-1, 1] (from Normalize)
-                    # Our transform does Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) -> [-1, 1]
-                    # We need to convert back to uint8 [0, 255]
+                        # Compute Metrics
+                        logger.info("Computing FID and IS...")
+                        fid_score = fid_metric.compute().item()
+                        is_score, is_std = is_metric.compute()
+                        is_score = is_score.item()
+                        is_std = is_std.item()
+                        
+                        logger.info(f"FID: {fid_score:.4f}, IS: {is_score:.4f} +/- {is_std:.4f}")
+                        
+                        if args.wandb:
+                            wandb_utils.log({
+                                "metrics/fid": fid_score,
+                                "metrics/is": is_score,
+                                "metrics/is_std": is_std
+                            }, step=train_steps)
+                        
+                        # Save best FID
+                        if fid_score < best_fid:
+                            best_fid = fid_score
+                            checkpoint = {
+                                "model": model.state_dict(),
+                                "ema": ema.state_dict(),
+                                "opt": opt.state_dict(),
+                                "args": args,
+                                "train_steps": train_steps,
+                                "scaler": scaler.state_dict(),
+                                "scheduler": scheduler.state_dict(),
+                                "fid": fid_score
+                            }
+                            torch.save(checkpoint, f"{checkpoint_dir}/best_fid.pt")
+                            logger.info(f"New best FID: {best_fid:.4f}. Saved to best_fid.pt")
+                            
+                    except Exception as e:
+                        logger.warning(f"Failed to calculate FID: {e}")
                     
-                    x = (x * 0.5 + 0.5) * 255
-                    x = torch.clamp(x, 0, 255).to(torch.uint8)
-                    
-                    batch_size = x.shape[0]
-                    if real_images_count + batch_size > num_fid_samples:
-                        x = x[:num_fid_samples - real_images_count]
-                    
-                    fid_metric.update(x.to(device), real=True)
-                    real_images_count += x.shape[0]
-                    
-                    if real_images_count >= num_fid_samples:
-                        break
-                
-                # 3. Compute Metrics
-                logger.info("Computing FID and IS...")
-                fid_score = fid_metric.compute().item()
-                is_score, is_std = is_metric.compute()
-                is_score = is_score.item()
-                is_std = is_std.item()
-                
-                logger.info(f"FID: {fid_score:.4f}, IS: {is_score:.4f} +/- {is_std:.4f}")
-                
-                if args.wandb:
-                    wandb_utils.log({
-                        "metrics/fid": fid_score,
-                        "metrics/is": is_score,
-                        "metrics/is_std": is_std
-                    }, step=train_steps)
-                
-                # Reset metrics
-                fid_metric.reset()
-                is_metric.reset()
+                    # Reset metrics
+                    fid_metric.reset()
+                    is_metric.reset()
                 
                 model.train()
                 

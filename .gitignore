@@ -30,6 +30,7 @@ coverage.xml
 wandb/
 results/
 results_local/
+results_test_*/
 pretrained_models/
 data/
 datasets/

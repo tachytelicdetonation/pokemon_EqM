@@ -33,5 +33,7 @@
   "train_eps": 0.0,
   "calculate_fid": true,
   "fid_every": 2000,
-  "num_fid_samples": 2000
+  "num_fid_samples": 2000,
+  "warmup_steps": 1000,
+  "mixed_precision": "bf16"
 }
