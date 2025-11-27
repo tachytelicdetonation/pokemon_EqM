@@ -17,6 +17,124 @@ def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
+def compute_spatial_decay_bias(dimensions, device, dtype, decay_rate=0.1, decay_radius=0.25, num_registers=0):
+    """
+    Compute uniform spatial decay bias in normalized [-1,+1] coordinate space.
+
+    Patches within `decay_radius` attend freely (bias=0). Beyond that radius,
+    a soft linear decay penalizes distant attention. Uses normalized coordinates
+    for resolution-invariant behavior.
+
+    Args:
+        dimensions: Tuple of spatial dimensions (H, W)
+        device: Target device
+        dtype: Target dtype
+        decay_rate: Decay factor outside radius (higher = stronger locality)
+        decay_radius: Radius in normalized space [0, ~2.83]. Default 0.25 covers ~8 patches at 32x32.
+        num_registers: Number of register tokens (they attend freely to everything)
+
+    Returns:
+        Spatial bias tensor of shape [1, 1, N, N] for broadcasting
+    """
+    H, W = dimensions
+    num_patches = H * W
+
+    # Normalized coordinates [-1, +1] matching LieRE DINOv3 mode
+    y_norm = (torch.arange(H, device=device, dtype=torch.float32) + 0.5) / H * 2 - 1
+    x_norm = (torch.arange(W, device=device, dtype=torch.float32) + 0.5) / W * 2 - 1
+    yy, xx = torch.meshgrid(y_norm, x_norm, indexing='ij')
+    coords = torch.stack([yy.flatten(), xx.flatten()], dim=1)  # [H*W, 2]
+
+    # Compute pairwise Euclidean distance in normalized space
+    dist = torch.cdist(coords, coords, p=2)  # [H*W, H*W]
+
+    # Free attention within radius, soft decay outside
+    effective_dist = torch.clamp(dist - decay_radius, min=0)
+
+    # Convert to negative bias (farther beyond radius = more negative = less attention)
+    spatial_bias = -decay_rate * effective_dist  # [H*W, H*W]
+
+    # Handle register tokens: they attend freely to everything
+    if num_registers > 0:
+        total_len = num_registers + num_patches
+        full_bias = torch.zeros(total_len, total_len, device=device, dtype=torch.float32)
+        full_bias[num_registers:, num_registers:] = spatial_bias
+        spatial_bias = full_bias
+
+    return spatial_bias.to(dtype=dtype).unsqueeze(0).unsqueeze(0)  # [1, 1, N, N]
+
+
+def compute_per_head_spatial_decay_bias(
+    dimensions, device, dtype, num_heads,
+    base_decay_rate=0.1, base_decay_radius=0.25, num_registers=0
+):
+    """
+    ALiBi-style per-head spatial decay in normalized [-1,+1] coordinate space.
+
+    Different attention heads have different locality preferences:
+    - Head 0: Most local (high decay rate, small radius)
+    - Head num_heads-1: Most global (low decay rate, large radius)
+
+    Uses normalized coordinates [-1, +1] consistent with LieRE DINOv3 mode,
+    making the bias resolution-invariant.
+
+    Reference: Inspired by ALiBi (Attention with Linear Biases) extended to 2D.
+
+    Args:
+        dimensions: Tuple of spatial dimensions (H, W)
+        device: Target device
+        dtype: Target dtype
+        num_heads: Number of attention heads
+        base_decay_rate: Base decay rate for head 0 (most local)
+        base_decay_radius: Base free-attention radius in normalized space for head 0
+        num_registers: Number of register tokens (attend freely to everything)
+
+    Returns:
+        Spatial bias tensor of shape [1, num_heads, N, N] for per-head broadcasting
+    """
+    H, W = dimensions
+    num_patches = H * W
+
+    # Normalized coordinates [-1, +1] matching LieRE DINOv3 mode
+    # Patch centers at (i + 0.5) / dim, then scaled to [-1, +1]
+    y_norm = (torch.arange(H, device=device, dtype=torch.float32) + 0.5) / H * 2 - 1
+    x_norm = (torch.arange(W, device=device, dtype=torch.float32) + 0.5) / W * 2 - 1
+    yy, xx = torch.meshgrid(y_norm, x_norm, indexing='ij')
+    coords = torch.stack([yy.flatten(), xx.flatten()], dim=1)  # [H*W, 2]
+
+    # Compute pairwise Euclidean distance in normalized space
+    # Max distance is ~2.83 (corner to corner: sqrt(2^2 + 2^2))
+    dist = torch.cdist(coords, coords, p=2)  # [H*W, H*W]
+
+    # ALiBi geometric series: head 0 = most local, head num_heads-1 = most global
+    # decay_rate[h] = base_rate / 2^(8 * h / num_heads)
+    # decay_radius[h] = base_radius * 2^(h / num_heads)
+    head_idx = torch.arange(num_heads, device=device, dtype=torch.float32)
+    decay_rates = base_decay_rate / (2 ** (8 * head_idx / num_heads))
+    decay_radii = base_decay_radius * (2 ** (head_idx / num_heads))
+
+    # Broadcast to compute per-head biases: [num_heads, H*W, H*W]
+    dist_exp = dist.unsqueeze(0)  # [1, H*W, H*W]
+    radii_exp = decay_radii.view(-1, 1, 1)  # [num_heads, 1, 1]
+    rates_exp = decay_rates.view(-1, 1, 1)  # [num_heads, 1, 1]
+
+    # effective_dist[h, i, j] = max(0, dist[i, j] - radius[h])
+    effective_dist = torch.clamp(dist_exp - radii_exp, min=0)
+
+    # spatial_bias[h, i, j] = -decay_rate[h] * effective_dist[h, i, j]
+    spatial_bias = -rates_exp * effective_dist  # [num_heads, H*W, H*W]
+
+    # Handle register tokens: they attend freely to everything
+    if num_registers > 0:
+        total_len = num_registers + num_patches
+        full_bias = torch.zeros(num_heads, total_len, total_len, device=device, dtype=torch.float32)
+        # Only apply spatial bias to patch-patch attention
+        full_bias[:, num_registers:, num_registers:] = spatial_bias
+        spatial_bias = full_bias
+
+    return spatial_bias.to(dtype=dtype).unsqueeze(0)  # [1, num_heads, N, N]
+
+
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
@@ -377,6 +495,10 @@ class Attention(nn.Module):
         liere_pos_embed_rescale=2.0,
         spatial_dims=None,  # (H, W) of patch grid for LieRE
         num_registers=0,    # Number of register tokens to skip for LieRE
+        use_spatial_decay=True,  # Enable spatial attention decay
+        spatial_decay_rate=0.1,   # Base decay rate (higher = stronger locality)
+        spatial_decay_radius=0.25,  # Base radius in normalized space
+        use_per_head_decay=True,  # ALiBi-style per-head decay (different heads = different locality)
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -385,6 +507,10 @@ class Attention(nn.Module):
         self.use_liere = use_liere
         self.spatial_dims = spatial_dims
         self.num_registers = num_registers
+        self.use_spatial_decay = use_spatial_decay
+        self.spatial_decay_rate = spatial_decay_rate
+        self.spatial_decay_radius = spatial_decay_radius
+        self.use_per_head_decay = use_per_head_decay
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -432,6 +558,35 @@ class Attention(nn.Module):
                 k = self.liere.apply_rotations(k, dimensions)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        # Apply spatial decay bias before softmax
+        if self.use_spatial_decay:
+            if self.spatial_dims is not None:
+                dimensions = self.spatial_dims
+            else:
+                num_patches = N - self.num_registers
+                side = int(num_patches ** 0.5)
+                dimensions = (side, side)
+
+            if self.use_per_head_decay:
+                # ALiBi-style per-head decay: different heads have different locality
+                spatial_bias = compute_per_head_spatial_decay_bias(
+                    dimensions, x.device, attn.dtype,
+                    num_heads=self.num_heads,
+                    base_decay_rate=self.spatial_decay_rate,
+                    base_decay_radius=self.spatial_decay_radius,
+                    num_registers=self.num_registers
+                )
+            else:
+                # Uniform decay across all heads
+                spatial_bias = compute_spatial_decay_bias(
+                    dimensions, x.device, attn.dtype,
+                    decay_rate=self.spatial_decay_rate,
+                    decay_radius=self.spatial_decay_radius,
+                    num_registers=self.num_registers
+                )
+            attn = attn + spatial_bias
+
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -497,6 +652,10 @@ class DifferentialAttention(nn.Module):
         spatial_dims=None,
         num_registers=0,
         layer_idx=0,  # Layer index for lambda initialization
+        use_spatial_decay=True,  # Enable spatial attention decay
+        spatial_decay_rate=0.1,   # Base decay rate (higher = stronger locality)
+        spatial_decay_radius=0.25,  # Base radius in normalized space
+        use_per_head_decay=True,  # ALiBi-style per-head decay
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -508,6 +667,10 @@ class DifferentialAttention(nn.Module):
         self.spatial_dims = spatial_dims
         self.num_registers = num_registers
         self.layer_idx = layer_idx
+        self.use_spatial_decay = use_spatial_decay
+        self.spatial_decay_rate = spatial_decay_rate
+        self.spatial_decay_radius = spatial_decay_radius
+        self.use_per_head_decay = use_per_head_decay
 
         # Q, K, V projections (same total dimension as standard attention)
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -600,6 +763,35 @@ class DifferentialAttention(nn.Module):
         # Compute two attention matrices
         attn1 = (q1 @ k1.transpose(-2, -1)) * self.scale  # [B, num_heads, N, N]
         attn2 = (q2 @ k2.transpose(-2, -1)) * self.scale
+
+        # Apply spatial decay bias before softmax
+        if self.use_spatial_decay:
+            if self.spatial_dims is not None:
+                dimensions = self.spatial_dims
+            else:
+                num_patches = N - self.num_registers
+                side = int(num_patches ** 0.5)
+                dimensions = (side, side)
+
+            if self.use_per_head_decay:
+                # ALiBi-style per-head decay: different heads have different locality
+                spatial_bias = compute_per_head_spatial_decay_bias(
+                    dimensions, x.device, attn1.dtype,
+                    num_heads=self.num_heads,
+                    base_decay_rate=self.spatial_decay_rate,
+                    base_decay_radius=self.spatial_decay_radius,
+                    num_registers=self.num_registers
+                )
+            else:
+                # Uniform decay across all heads
+                spatial_bias = compute_spatial_decay_bias(
+                    dimensions, x.device, attn1.dtype,
+                    decay_rate=self.spatial_decay_rate,
+                    decay_radius=self.spatial_decay_radius,
+                    num_registers=self.num_registers
+                )
+            attn1 = attn1 + spatial_bias
+            attn2 = attn2 + spatial_bias
 
         attn1 = attn1.softmax(dim=-1)
         attn2 = attn2.softmax(dim=-1)
@@ -712,6 +904,10 @@ class EqM(nn.Module):
         liere_pos_embed_rescale=2.0,
         num_registers=0,  # Number of register tokens (attention sinks)
         use_diff_attn=False,  # Use differential attention (from Microsoft Diff-Transformer)
+        use_spatial_decay=True,  # Enable spatial attention decay
+        spatial_decay_rate=0.1,   # Base decay rate (higher = stronger locality)
+        spatial_decay_radius=0.25,  # Base radius in normalized [-1,+1] space
+        use_per_head_decay=True,  # ALiBi-style per-head decay (different heads = different locality)
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -746,6 +942,10 @@ class EqM(nn.Module):
             liere_pos_embed_rescale=liere_pos_embed_rescale,
             spatial_dims=self.spatial_dims,
             num_registers=num_registers,
+            use_spatial_decay=use_spatial_decay,
+            spatial_decay_rate=spatial_decay_rate,
+            spatial_decay_radius=spatial_decay_radius,
+            use_per_head_decay=use_per_head_decay,
         )
 
         # Create blocks with layer indices for differential attention lambda initialization

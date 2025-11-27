@@ -41,5 +41,9 @@
   "use_sigreg": true,
   "sigreg_lambda": 0.05,
   "sigreg_num_slices": 1024,
-  "use_diff_attn": true
+  "use_diff_attn": true,
+  "use_spatial_decay": true,
+  "spatial_decay_rate": 0.1,
+  "spatial_decay_radius": 0.25,
+  "use_per_head_decay": true
 }

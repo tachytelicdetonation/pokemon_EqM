@@ -264,6 +264,10 @@ def main(args):
         liere_pos_embed_rescale=getattr(args, 'liere_pos_embed_rescale', 2.0),
         num_registers=getattr(args, 'num_registers', 0),  # Register tokens for attention sinks
         use_diff_attn=getattr(args, 'use_diff_attn', False),  # Differential attention
+        use_spatial_decay=getattr(args, 'use_spatial_decay', False),  # Spatial attention decay
+        spatial_decay_rate=getattr(args, 'spatial_decay_rate', 0.1),  # Base decay rate
+        spatial_decay_radius=getattr(args, 'spatial_decay_radius', 0.25),  # Base radius in normalized space
+        use_per_head_decay=getattr(args, 'use_per_head_decay', True),  # ALiBi-style per-head decay
     ).to(device)
 
     # Note that parameter initialization is done within the EqM constructor
