@@ -19,6 +19,7 @@
   "cfg_scale": 4.0,
   "uncond": true,
   "ebm": "none",
+  "use_disp": true,
   "grad_clip": 0.0,
   "use_liere": true,
   "liere_jitter_std": 0.1,
@@ -39,5 +40,6 @@
   "num_registers": 4,
   "use_sigreg": true,
   "sigreg_lambda": 0.05,
-  "sigreg_num_slices": 1024
+  "sigreg_num_slices": 1024,
+  "use_diff_attn": true
 }

@@ -77,7 +77,7 @@ except ImportError:
 #################################################################################
 
 @torch.no_grad()
-def update_ema(ema_model, model, decay=0.999):
+def update_ema(ema_model, model, decay=0.9999):
     """
     Step the EMA model towards the current model.
     """
@@ -263,6 +263,7 @@ def main(args):
         liere_pos_embed_jitter=getattr(args, 'liere_pos_embed_jitter', None),
         liere_pos_embed_rescale=getattr(args, 'liere_pos_embed_rescale', 2.0),
         num_registers=getattr(args, 'num_registers', 0),  # Register tokens for attention sinks
+        use_diff_attn=getattr(args, 'use_diff_attn', False),  # Differential attention
     ).to(device)
 
     # Note that parameter initialization is done within the EqM constructor
@@ -420,8 +421,9 @@ def main(args):
                 else:
                     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             
-            model_kwargs = dict(y=y, return_act=False, train=True)
-            model_kwargs = dict(y=y, return_act=False, train=True)
+            # Enable return_act for dispersive loss (improves FID by ~20%)
+            use_disp = getattr(args, 'use_disp', True)
+            model_kwargs = dict(y=y, return_act=use_disp, train=True)
             
             opt.zero_grad()
             

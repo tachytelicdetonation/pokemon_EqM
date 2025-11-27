@@ -441,14 +441,215 @@ class Attention(nn.Module):
         return x
 
 
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization (used in Differential Attention).
+    """
+    def __init__(self, dim, eps=1e-5, elementwise_affine=True):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(dim))
+        else:
+            self.register_parameter('weight', None)
+
+    def forward(self, x):
+        rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
+        x_normed = x / rms
+        if self.weight is not None:
+            return x_normed * self.weight
+        return x_normed
+
+
+def lambda_init_fn(depth):
+    """
+    Initialize lambda based on layer depth (from Microsoft Diff-Transformer paper).
+    Deeper layers get larger lambda values for more aggressive noise cancellation.
+    """
+    return 0.8 - 0.6 * math.exp(-0.3 * depth)
+
+
+class DifferentialAttention(nn.Module):
+    """
+    Differential Attention mechanism from Microsoft's Diff-Transformer paper.
+    Combines two attention computations: attn = softmax(Q1K1) - λ·softmax(Q2K2)
+
+    This helps cancel attention noise and improves head diversity.
+    Integrates with LieRE for learnable rotary positional embeddings.
+
+    Reference: https://arxiv.org/abs/2410.05258
+    """
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        qkv_bias=False,
+        attn_drop=0.,
+        proj_drop=0.,
+        use_liere=False,
+        liere_jitter_std=0.0,
+        liere_jitter_mode='gaussian',
+        liere_pos_embed_shift=None,
+        liere_pos_embed_jitter=None,
+        liere_pos_embed_rescale=2.0,
+        spatial_dims=None,
+        num_registers=0,
+        layer_idx=0,  # Layer index for lambda initialization
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        # For differential attention, we split heads into pairs
+        # So effective head_dim is halved compared to standard attention
+        self.head_dim = dim // num_heads // 2
+        self.scale = self.head_dim ** -0.5
+        self.use_liere = use_liere
+        self.spatial_dims = spatial_dims
+        self.num_registers = num_registers
+        self.layer_idx = layer_idx
+
+        # Q, K, V projections (same total dimension as standard attention)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        # Learnable lambda parameters for differential attention
+        self.lambda_init = lambda_init_fn(layer_idx)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
+
+        # SubLayer normalization (RMSNorm as per the paper)
+        self.subln = RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
+
+        if self.use_liere:
+            # LieRE operates on the halved head_dim for differential attention
+            self.liere = LieRE(
+                num_dim=2,
+                dim=self.head_dim,
+                jitter_std=liere_jitter_std,
+                jitter_mode=liere_jitter_mode,
+                pos_embed_shift=liere_pos_embed_shift,
+                pos_embed_jitter=liere_pos_embed_jitter,
+                pos_embed_rescale=liere_pos_embed_rescale
+            )
+
+    def forward(self, x):
+        B, N, C = x.shape
+
+        # Project to Q, K, V
+        qkv = self.qkv(x).reshape(B, N, 3, C).permute(2, 0, 1, 3)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # Each is [B, N, C]
+
+        # Reshape for differential attention: split into 2*num_heads with head_dim each
+        # q, k: [B, N, 2*num_heads, head_dim]
+        # v: [B, N, num_heads, 2*head_dim]
+        q = q.view(B, N, 2 * self.num_heads, self.head_dim)
+        k = k.view(B, N, 2 * self.num_heads, self.head_dim)
+        v = v.view(B, N, self.num_heads, 2 * self.head_dim)
+
+        # Split Q and K into pairs for differential computation
+        q = q.view(B, N, self.num_heads, 2, self.head_dim)
+        k = k.view(B, N, self.num_heads, 2, self.head_dim)
+        q1, q2 = q[:, :, :, 0], q[:, :, :, 1]  # [B, N, num_heads, head_dim]
+        k1, k2 = k[:, :, :, 0], k[:, :, :, 1]
+
+        # Transpose for attention: [B, num_heads, N, head_dim]
+        q1 = q1.permute(0, 2, 1, 3)
+        q2 = q2.permute(0, 2, 1, 3)
+        k1 = k1.permute(0, 2, 1, 3)
+        k2 = k2.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)  # [B, num_heads, N, 2*head_dim]
+
+        # Apply LieRE to both Q/K pairs
+        if self.use_liere:
+            if self.spatial_dims is not None:
+                dimensions = self.spatial_dims
+            else:
+                num_patches = N - self.num_registers
+                side = int(num_patches ** 0.5)
+                dimensions = (side, side)
+
+            if self.num_registers > 0:
+                # Split register tokens (don't apply LieRE to them)
+                q1_reg, q1_patch = q1[:, :, :self.num_registers], q1[:, :, self.num_registers:]
+                q2_reg, q2_patch = q2[:, :, :self.num_registers], q2[:, :, self.num_registers:]
+                k1_reg, k1_patch = k1[:, :, :self.num_registers], k1[:, :, self.num_registers:]
+                k2_reg, k2_patch = k2[:, :, :self.num_registers], k2[:, :, self.num_registers:]
+
+                # Apply LieRE to patch tokens
+                q1_patch = self.liere.apply_rotations(q1_patch, dimensions)
+                q2_patch = self.liere.apply_rotations(q2_patch, dimensions)
+                k1_patch = self.liere.apply_rotations(k1_patch, dimensions)
+                k2_patch = self.liere.apply_rotations(k2_patch, dimensions)
+
+                # Recombine
+                q1 = torch.cat([q1_reg, q1_patch], dim=2)
+                q2 = torch.cat([q2_reg, q2_patch], dim=2)
+                k1 = torch.cat([k1_reg, k1_patch], dim=2)
+                k2 = torch.cat([k2_reg, k2_patch], dim=2)
+            else:
+                q1 = self.liere.apply_rotations(q1, dimensions)
+                q2 = self.liere.apply_rotations(q2, dimensions)
+                k1 = self.liere.apply_rotations(k1, dimensions)
+                k2 = self.liere.apply_rotations(k2, dimensions)
+
+        # Compute two attention matrices
+        attn1 = (q1 @ k1.transpose(-2, -1)) * self.scale  # [B, num_heads, N, N]
+        attn2 = (q2 @ k2.transpose(-2, -1)) * self.scale
+
+        attn1 = attn1.softmax(dim=-1)
+        attn2 = attn2.softmax(dim=-1)
+
+        attn1 = self.attn_drop(attn1)
+        attn2 = self.attn_drop(attn2)
+
+        # Compute attention outputs
+        out1 = attn1 @ v  # [B, num_heads, N, 2*head_dim]
+        out2 = attn2 @ v
+
+        # Compute lambda value
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1))
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1))
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+
+        # Differential attention: subtract weighted second attention
+        out = out1 - lambda_full * out2  # [B, num_heads, N, 2*head_dim]
+
+        # Apply sublayer normalization and scaling
+        out = out.permute(0, 2, 1, 3)  # [B, N, num_heads, 2*head_dim]
+        out = self.subln(out)
+        out = out * (1 - self.lambda_init)
+
+        # Reshape and project
+        out = out.reshape(B, N, C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+
+        return out
+
+
 class SiTBlock(nn.Module):
     """
     A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    Supports both standard and differential attention.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_diff_attn=False, layer_idx=0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+
+        # Choose attention type
+        if use_diff_attn:
+            self.attn = DifferentialAttention(
+                hidden_size, num_heads=num_heads, qkv_bias=True,
+                layer_idx=layer_idx, **block_kwargs
+            )
+        else:
+            self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -510,6 +711,7 @@ class EqM(nn.Module):
         liere_pos_embed_jitter=None,
         liere_pos_embed_rescale=2.0,
         num_registers=0,  # Number of register tokens (attention sinks)
+        use_diff_attn=False,  # Use differential attention (from Microsoft Diff-Transformer)
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -517,6 +719,7 @@ class EqM(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.use_diff_attn = use_diff_attn
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
@@ -545,8 +748,12 @@ class EqM(nn.Module):
             num_registers=num_registers,
         )
 
+        # Create blocks with layer indices for differential attention lambda initialization
         self.blocks = nn.ModuleList([
-            SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs) for _ in range(depth)
+            SiTBlock(
+                hidden_size, num_heads, mlp_ratio=mlp_ratio,
+                use_diff_attn=use_diff_attn, layer_idx=i, **block_kwargs
+            ) for i in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
