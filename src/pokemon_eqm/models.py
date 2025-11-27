@@ -375,12 +375,16 @@ class Attention(nn.Module):
         liere_pos_embed_shift=None,
         liere_pos_embed_jitter=None,
         liere_pos_embed_rescale=2.0,
+        spatial_dims=None,  # (H, W) of patch grid for LieRE
+        num_registers=0,    # Number of register tokens to skip for LieRE
     ):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
         self.use_liere = use_liere
+        self.spatial_dims = spatial_dims
+        self.num_registers = num_registers
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -404,11 +408,28 @@ class Attention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
         if self.use_liere:
-            # Apply LieRE (learnable rotations)
-            side = int(N ** 0.5)
-            dimensions = (side, side)
-            q = self.liere.apply_rotations(q, dimensions)
-            k = self.liere.apply_rotations(k, dimensions)
+            # Apply LieRE (learnable rotations) only to patch tokens, not register tokens
+            if self.spatial_dims is not None:
+                dimensions = self.spatial_dims
+            else:
+                # Fallback: compute from sequence length (for backwards compatibility)
+                num_patches = N - self.num_registers
+                side = int(num_patches ** 0.5)
+                dimensions = (side, side)
+
+            if self.num_registers > 0:
+                # Split: register tokens don't get positional rotations
+                q_reg, q_patch = q[:, :, :self.num_registers], q[:, :, self.num_registers:]
+                k_reg, k_patch = k[:, :, :self.num_registers], k[:, :, self.num_registers:]
+                # Apply rotations to patches only
+                q_patch = self.liere.apply_rotations(q_patch, dimensions)
+                k_patch = self.liere.apply_rotations(k_patch, dimensions)
+                # Recombine
+                q = torch.cat([q_reg, q_patch], dim=2)
+                k = torch.cat([k_reg, k_patch], dim=2)
+            else:
+                q = self.liere.apply_rotations(q, dimensions)
+                k = self.liere.apply_rotations(k, dimensions)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
@@ -509,6 +530,10 @@ class EqM(nn.Module):
         if num_registers > 0:
             self.register_tokens = nn.Parameter(torch.zeros(1, num_registers, hidden_size))
 
+        # Compute spatial dimensions for LieRE (patch grid size)
+        spatial_side = input_size // patch_size
+        self.spatial_dims = (spatial_side, spatial_side)
+
         block_kwargs = dict(
             use_liere=use_liere,
             liere_jitter_std=liere_jitter_std,
@@ -516,6 +541,8 @@ class EqM(nn.Module):
             liere_pos_embed_shift=liere_pos_embed_shift,
             liere_pos_embed_jitter=liere_pos_embed_jitter,
             liere_pos_embed_rescale=liere_pos_embed_rescale,
+            spatial_dims=self.spatial_dims,
+            num_registers=num_registers,
         )
 
         self.blocks = nn.ModuleList([
