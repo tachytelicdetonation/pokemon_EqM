@@ -567,7 +567,8 @@ def main(args):
                     disp_val = loss_dict['disp_loss']
                     log_dict["train/disp_loss"] = disp_val.item() if torch.is_tensor(disp_val) else disp_val
 
-                # Compute attention metrics and store data for checkpoint GIF generation
+                # Compute attention metrics (every step) and store viz data (periodically)
+                attention_viz_every = getattr(args, 'attention_viz_every', 50)  # Store viz data every N steps
                 if getattr(args, 'compute_attention_metrics', True):
                     sample_x_attn = x[:1]  # Use first sample from batch
                     sample_t_attn = torch.rand(1, device=device)
@@ -591,41 +592,44 @@ def main(args):
 
                         if use_diff_attn and isinstance(attn_weights, dict):
                             attn_for_metrics = attn_weights['attn1']
-                            attn1_viz = attn_weights['attn1'][0]  # First sample
-                            attn2_viz = attn_weights['attn2'][0]  # First sample
-                            # Store differential attention data
-                            visualizer.store_diff_attention_data(attn1_viz, attn2_viz, train_steps, num_registers)
                         else:
                             if attn_weights.dim() == 3:
                                 attn_for_metrics = attn_weights.unsqueeze(0)
                             else:
                                 attn_for_metrics = attn_weights
-                            attn_for_viz = attn_weights[0] if attn_weights.dim() == 4 else attn_weights
-                            # Store regular attention data
-                            visualizer.store_attention_data(attn_for_viz, train_steps, num_registers)
 
                         N = attn_for_metrics.shape[-1]
                         num_patches_total = N - num_registers if num_registers > 0 else N
                         spatial_size = int(num_patches_total ** 0.5)
 
-                        # Compute all metrics
+                        # Compute all metrics (every step - lightweight)
                         metrics = compute_all_metrics(
                             attn=attn_for_metrics,
                             spatial_size=spatial_size,
                             num_registers=num_registers,
                         )
 
-                        # Add scalar metrics to log dict (lightweight, logged every step)
+                        # Add scalar metrics to log dict (logged every step)
                         scalar_metrics = get_scalar_metrics(metrics)
                         for k, v in scalar_metrics.items():
                             log_dict[f'attention/{k}'] = v
 
-                        # Store metrics history and raw data for GIF generation at checkpoints
-                        visualizer.add_metrics(train_steps, scalar_metrics)
-                        if 'entropy/per_head' in metrics:
-                            visualizer.store_entropy_data(metrics['entropy/per_head'], train_steps)
-                        if 'diversity/similarity_matrix' in metrics:
-                            visualizer.store_similarity_data(metrics['diversity/similarity_matrix'], train_steps)
+                        # Store visualization data periodically (not every step)
+                        if train_steps % attention_viz_every == 0:
+                            visualizer.add_metrics(train_steps, scalar_metrics)
+
+                            if use_diff_attn and isinstance(attn_weights, dict):
+                                attn1_viz = attn_weights['attn1'][0]
+                                attn2_viz = attn_weights['attn2'][0]
+                                visualizer.store_diff_attention_data(attn1_viz, attn2_viz, train_steps, num_registers)
+                            else:
+                                attn_for_viz = attn_weights[0] if attn_weights.dim() == 4 else attn_weights
+                                visualizer.store_attention_data(attn_for_viz, train_steps, num_registers)
+
+                            if 'entropy/per_head' in metrics:
+                                visualizer.store_entropy_data(metrics['entropy/per_head'], train_steps)
+                            if 'diversity/similarity_matrix' in metrics:
+                                visualizer.store_similarity_data(metrics['diversity/similarity_matrix'], train_steps)
 
                     if was_training:
                         model.train()

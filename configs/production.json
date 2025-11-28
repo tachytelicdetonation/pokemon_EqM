@@ -49,8 +49,8 @@
   "decay_type": "learned",
   "distance_type": "l2",
   "use_content_gate": false,
-  "log_attention_every": 100,
   "compute_attention_metrics": true,
+  "attention_viz_every": 50,
   "attention_sparsity_threshold": 0.01,
   "attention_top_k": 5
 }
