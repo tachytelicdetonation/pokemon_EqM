@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import io
 from PIL import Image
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
 
 
@@ -660,8 +660,8 @@ class AttentionVisualizer:
 
         pbar = tqdm(total=total_frames, desc="Generating GIF frames", leave=False)
 
-        # Use ThreadPoolExecutor for parallel rendering
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Use ProcessPoolExecutor for true parallel rendering (bypasses GIL)
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
             # Submit attention frame tasks
             attn_futures = []
             for step, attn_np in self.attention_data:
