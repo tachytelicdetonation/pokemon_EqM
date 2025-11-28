@@ -66,7 +66,8 @@ def compute_spatial_decay_bias(dimensions, device, dtype, decay_rate=0.1, decay_
 
 def compute_per_head_spatial_decay_bias(
     dimensions, device, dtype, num_heads,
-    base_decay_rate=0.1, base_decay_radius=0.25, num_registers=0
+    base_decay_rate=0.1, base_decay_radius=0.25, num_registers=0,
+    decay_type='exponential', distance_type='l2', content_gate=None
 ):
     """
     ALiBi-style per-head spatial decay in normalized [-1,+1] coordinate space.
@@ -78,7 +79,10 @@ def compute_per_head_spatial_decay_bias(
     Uses normalized coordinates [-1, +1] consistent with LieRE DINOv3 mode,
     making the bias resolution-invariant.
 
-    Reference: Inspired by ALiBi (Attention with Linear Biases) extended to 2D.
+    References:
+    - ALiBi (Attention with Linear Biases) extended to 2D
+    - Radial Attention: exponential decay like physical signal decay
+    - SDT (Spatial Decay Transformer): content-aware gating
 
     Args:
         dimensions: Tuple of spatial dimensions (H, W)
@@ -88,6 +92,9 @@ def compute_per_head_spatial_decay_bias(
         base_decay_rate: Base decay rate for head 0 (most local)
         base_decay_radius: Base free-attention radius in normalized space for head 0
         num_registers: Number of register tokens (attend freely to everything)
+        decay_type: 'exponential' (natural signal decay) or 'linear' (original)
+        distance_type: 'l2' (Euclidean) or 'l1' (Manhattan)
+        content_gate: Optional [B, num_heads, 1, 1] tensor from ContentAwareGate
 
     Returns:
         Spatial bias tensor of shape [1, num_heads, N, N] for per-head broadcasting
@@ -96,19 +103,20 @@ def compute_per_head_spatial_decay_bias(
     num_patches = H * W
 
     # Normalized coordinates [-1, +1] matching LieRE DINOv3 mode
-    # Patch centers at (i + 0.5) / dim, then scaled to [-1, +1]
     y_norm = (torch.arange(H, device=device, dtype=torch.float32) + 0.5) / H * 2 - 1
     x_norm = (torch.arange(W, device=device, dtype=torch.float32) + 0.5) / W * 2 - 1
     yy, xx = torch.meshgrid(y_norm, x_norm, indexing='ij')
     coords = torch.stack([yy.flatten(), xx.flatten()], dim=1)  # [H*W, 2]
 
-    # Compute pairwise Euclidean distance in normalized space
-    # Max distance is ~2.83 (corner to corner: sqrt(2^2 + 2^2))
-    dist = torch.cdist(coords, coords, p=2)  # [H*W, H*W]
+    # Compute pairwise distance in normalized space
+    if distance_type == 'l1':
+        # Manhattan distance: |y1-y2| + |x1-x2|
+        dist = torch.cdist(coords, coords, p=1)  # Max ~4.0 (corner to corner)
+    else:
+        # Euclidean distance: sqrt((y1-y2)^2 + (x1-x2)^2)
+        dist = torch.cdist(coords, coords, p=2)  # Max ~2.83 (corner to corner)
 
     # ALiBi geometric series: head 0 = most local, head num_heads-1 = most global
-    # decay_rate[h] = base_rate / 2^(8 * h / num_heads)
-    # decay_radius[h] = base_radius * 2^(h / num_heads)
     head_idx = torch.arange(num_heads, device=device, dtype=torch.float32)
     decay_rates = base_decay_rate / (2 ** (8 * head_idx / num_heads))
     decay_radii = base_decay_radius * (2 ** (head_idx / num_heads))
@@ -121,18 +129,111 @@ def compute_per_head_spatial_decay_bias(
     # effective_dist[h, i, j] = max(0, dist[i, j] - radius[h])
     effective_dist = torch.clamp(dist_exp - radii_exp, min=0)
 
-    # spatial_bias[h, i, j] = -decay_rate[h] * effective_dist[h, i, j]
-    spatial_bias = -rates_exp * effective_dist  # [num_heads, H*W, H*W]
+    # Apply decay type
+    if decay_type == 'exponential':
+        # Exponential decay: bias approaches -rate as dist -> inf (like physical signal decay)
+        # Formula: -rate * (1 - exp(-scale * dist))
+        if content_gate is not None:
+            # Content-modulated: gate [B, num_heads, 1, 1] controls decay strength
+            # Note: content_gate will be applied in the attention forward pass
+            # Here we just compute the base exponential decay
+            spatial_bias = -rates_exp * (1 - torch.exp(-effective_dist))
+        else:
+            spatial_bias = -rates_exp * (1 - torch.exp(-effective_dist))
+    else:
+        # Linear decay (original): -rate * dist
+        spatial_bias = -rates_exp * effective_dist
 
     # Handle register tokens: they attend freely to everything
     if num_registers > 0:
         total_len = num_registers + num_patches
         full_bias = torch.zeros(num_heads, total_len, total_len, device=device, dtype=torch.float32)
-        # Only apply spatial bias to patch-patch attention
         full_bias[:, num_registers:, num_registers:] = spatial_bias
         spatial_bias = full_bias
 
     return spatial_bias.to(dtype=dtype).unsqueeze(0)  # [1, num_heads, N, N]
+
+
+class LearnedSpatialDecay(nn.Module):
+    """
+    SDT-style learned spatial decay for attention.
+
+    Instead of fixed decay formulas, learns per-token decay from content.
+    Uses log-sigmoid to ensure decay is always non-positive (reduces attention).
+
+    Formula:
+        G[i] = log(sigmoid(x[i] @ W))  # per-token decay in (-∞, 0]
+        bias[i,j] = 0.5 * (G[i] + G[j]) * distance(i,j) * alpha
+
+    Reference: "Learning Spatial Decay for Vision Transformers" (SDT, 2025)
+    """
+    def __init__(self, head_dim, num_heads, distance_type='l2'):
+        super().__init__()
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.distance_type = distance_type
+
+        # Per-token decay projection (shared across heads for efficiency)
+        self.decay_proj = nn.Linear(head_dim, 1)
+
+        # Learnable alpha per head (controls decay strength)
+        self.alpha = nn.Parameter(torch.ones(num_heads) * 0.1)
+
+    def forward(self, x, dimensions, num_registers=0):
+        """
+        Compute learned spatial decay bias.
+
+        Args:
+            x: Query or Key tensor [B, num_heads, N, head_dim]
+            dimensions: (H, W) spatial dimensions
+            num_registers: Number of register tokens (get zero decay)
+
+        Returns:
+            bias: [B, num_heads, N, N] with values ≤ 0
+        """
+        B, num_heads, N, head_dim = x.shape
+        H, W = dimensions
+        num_patches = H * W
+
+        # Compute per-token decay using log-sigmoid (always ≤ 0)
+        decay_logits = self.decay_proj(x)  # [B, num_heads, N, 1]
+        G = F.logsigmoid(decay_logits)  # [B, num_heads, N, 1], in (-∞, 0]
+
+        # Compute distance matrix (normalized coordinates)
+        y_norm = (torch.arange(H, device=x.device, dtype=x.dtype) + 0.5) / H * 2 - 1
+        x_norm = (torch.arange(W, device=x.device, dtype=x.dtype) + 0.5) / W * 2 - 1
+        yy, xx = torch.meshgrid(y_norm, x_norm, indexing='ij')
+        coords = torch.stack([yy.flatten(), xx.flatten()], dim=1)
+
+        if self.distance_type == 'l1':
+            dist = torch.cdist(coords, coords, p=1)
+        else:
+            dist = torch.cdist(coords, coords, p=2)
+
+        # Handle registers
+        if num_registers > 0:
+            G_patch = G[:, :, num_registers:, :]  # [B, num_heads, num_patches, 1]
+
+            # Symmetric combination: M[i,j] = 0.5 * (G[i] + G[j])
+            G_i = G_patch
+            G_j = G_patch.transpose(-2, -1)
+            decay_sym = 0.5 * (G_i + G_j)  # [B, num_heads, num_patches, num_patches]
+
+            # Scale by distance and learnable alpha
+            alpha = self.alpha.view(1, num_heads, 1, 1)
+            bias_patches = decay_sym * dist.unsqueeze(0).unsqueeze(0) * alpha
+
+            # Full bias with registers (registers have zero bias)
+            full_bias = torch.zeros(B, num_heads, N, N, device=x.device, dtype=x.dtype)
+            full_bias[:, :, num_registers:, num_registers:] = bias_patches
+            return full_bias
+        else:
+            G_i = G
+            G_j = G.transpose(-2, -1)
+            decay_sym = 0.5 * (G_i + G_j)
+
+            alpha = self.alpha.view(1, num_heads, 1, 1)
+            return decay_sym * dist.unsqueeze(0).unsqueeze(0) * alpha
 
 
 #################################################################################
@@ -499,10 +600,14 @@ class Attention(nn.Module):
         spatial_decay_rate=0.1,   # Base decay rate (higher = stronger locality)
         spatial_decay_radius=0.25,  # Base radius in normalized space
         use_per_head_decay=True,  # ALiBi-style per-head decay (different heads = different locality)
+        decay_type='exponential',  # 'exponential', 'linear', or 'learned' (SDT-style)
+        distance_type='l2',  # 'l2' (Euclidean) or 'l1' (Manhattan)
+        use_content_gate=True,  # Content-aware gating (only for non-learned decay)
     ):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
+        self.head_dim = head_dim
         self.scale = head_dim ** -0.5
         self.use_liere = use_liere
         self.spatial_dims = spatial_dims
@@ -511,11 +616,21 @@ class Attention(nn.Module):
         self.spatial_decay_rate = spatial_decay_rate
         self.spatial_decay_radius = spatial_decay_radius
         self.use_per_head_decay = use_per_head_decay
+        self.decay_type = decay_type
+        self.distance_type = distance_type
+        self.use_content_gate = use_content_gate
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+
+        # SDT-style learned spatial decay (replaces content gate when decay_type='learned')
+        if decay_type == 'learned' and use_spatial_decay:
+            self.learned_decay = LearnedSpatialDecay(head_dim, num_heads, distance_type)
+        elif use_content_gate and use_spatial_decay:
+            # Legacy content-aware gate for non-learned decay types
+            self.content_gate = LearnedSpatialDecay(head_dim, num_heads, distance_type)
 
         if self.use_liere:
             self.liere = LieRE(
@@ -528,7 +643,7 @@ class Attention(nn.Module):
                 pos_embed_rescale=liere_pos_embed_rescale
             )
 
-    def forward(self, x):
+    def forward(self, x, return_attention=False):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
@@ -568,15 +683,24 @@ class Attention(nn.Module):
                 side = int(num_patches ** 0.5)
                 dimensions = (side, side)
 
-            if self.use_per_head_decay:
-                # ALiBi-style per-head decay: different heads have different locality
+            if self.decay_type == 'learned':
+                # SDT-style: fully learned decay from content
+                spatial_bias = self.learned_decay(q, dimensions, self.num_registers)
+            elif self.use_per_head_decay:
+                # ALiBi-style per-head decay with exponential/linear
                 spatial_bias = compute_per_head_spatial_decay_bias(
                     dimensions, x.device, attn.dtype,
                     num_heads=self.num_heads,
                     base_decay_rate=self.spatial_decay_rate,
                     base_decay_radius=self.spatial_decay_radius,
-                    num_registers=self.num_registers
+                    num_registers=self.num_registers,
+                    decay_type=self.decay_type,
+                    distance_type=self.distance_type
                 )
+                # Apply content-aware gating if enabled
+                if self.use_content_gate and hasattr(self, 'content_gate'):
+                    content_gate = self.content_gate(q, dimensions, self.num_registers)
+                    spatial_bias = spatial_bias + content_gate  # Add learned component
             else:
                 # Uniform decay across all heads
                 spatial_bias = compute_spatial_decay_bias(
@@ -588,11 +712,15 @@ class Attention(nn.Module):
             attn = attn + spatial_bias
 
         attn = attn.softmax(dim=-1)
+        attn_weights = attn  # Save for visualization before dropout
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+
+        if return_attention:
+            return x, attn_weights
         return x
 
 
@@ -656,6 +784,9 @@ class DifferentialAttention(nn.Module):
         spatial_decay_rate=0.1,   # Base decay rate (higher = stronger locality)
         spatial_decay_radius=0.25,  # Base radius in normalized space
         use_per_head_decay=True,  # ALiBi-style per-head decay
+        decay_type='exponential',  # 'exponential', 'linear', or 'learned' (SDT-style)
+        distance_type='l2',  # 'l2' (Euclidean) or 'l1' (Manhattan)
+        use_content_gate=True,  # Content-aware gating (only for non-learned decay)
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -671,12 +802,21 @@ class DifferentialAttention(nn.Module):
         self.spatial_decay_rate = spatial_decay_rate
         self.spatial_decay_radius = spatial_decay_radius
         self.use_per_head_decay = use_per_head_decay
+        self.decay_type = decay_type
+        self.distance_type = distance_type
+        self.use_content_gate = use_content_gate
 
         # Q, K, V projections (same total dimension as standard attention)
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+
+        # SDT-style learned spatial decay or content-aware gate
+        if decay_type == 'learned' and use_spatial_decay:
+            self.learned_decay = LearnedSpatialDecay(self.head_dim, num_heads, distance_type)
+        elif use_content_gate and use_spatial_decay:
+            self.content_gate = LearnedSpatialDecay(self.head_dim, num_heads, distance_type)
 
         # Learnable lambda parameters for differential attention
         self.lambda_init = lambda_init_fn(layer_idx)
@@ -700,7 +840,7 @@ class DifferentialAttention(nn.Module):
                 pos_embed_rescale=liere_pos_embed_rescale
             )
 
-    def forward(self, x):
+    def forward(self, x, return_attention=False):
         B, N, C = x.shape
 
         # Project to Q, K, V
@@ -773,15 +913,24 @@ class DifferentialAttention(nn.Module):
                 side = int(num_patches ** 0.5)
                 dimensions = (side, side)
 
-            if self.use_per_head_decay:
-                # ALiBi-style per-head decay: different heads have different locality
+            if self.decay_type == 'learned':
+                # SDT-style: fully learned decay from content
+                spatial_bias = self.learned_decay(q1, dimensions, self.num_registers)
+            elif self.use_per_head_decay:
+                # ALiBi-style per-head decay with exponential/linear
                 spatial_bias = compute_per_head_spatial_decay_bias(
                     dimensions, x.device, attn1.dtype,
                     num_heads=self.num_heads,
                     base_decay_rate=self.spatial_decay_rate,
                     base_decay_radius=self.spatial_decay_radius,
-                    num_registers=self.num_registers
+                    num_registers=self.num_registers,
+                    decay_type=self.decay_type,
+                    distance_type=self.distance_type
                 )
+                # Apply content-aware gating if enabled
+                if self.use_content_gate and hasattr(self, 'content_gate'):
+                    content_gate = self.content_gate(q1, dimensions, self.num_registers)
+                    spatial_bias = spatial_bias + content_gate
             else:
                 # Uniform decay across all heads
                 spatial_bias = compute_spatial_decay_bias(
@@ -795,6 +944,10 @@ class DifferentialAttention(nn.Module):
 
         attn1 = attn1.softmax(dim=-1)
         attn2 = attn2.softmax(dim=-1)
+
+        # Save attention weights for visualization before dropout
+        attn1_weights = attn1
+        attn2_weights = attn2
 
         attn1 = self.attn_drop(attn1)
         attn2 = self.attn_drop(attn2)
@@ -821,6 +974,9 @@ class DifferentialAttention(nn.Module):
         out = self.proj(out)
         out = self.proj_drop(out)
 
+        if return_attention:
+            # Return both attention matrices for differential attention visualization
+            return out, {'attn1': attn1_weights, 'attn2': attn2_weights, 'lambda': lambda_full}
         return out
 
 
@@ -851,11 +1007,18 @@ class SiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, return_attention=False):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        return x
+
+        if return_attention:
+            attn_out, attn_weights = self.attn(modulate(self.norm1(x), shift_msa, scale_msa), return_attention=True)
+            x = x + gate_msa.unsqueeze(1) * attn_out
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+            return x, attn_weights
+        else:
+            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+            return x
 
 
 class FinalLayer(nn.Module):
@@ -908,6 +1071,9 @@ class EqM(nn.Module):
         spatial_decay_rate=0.1,   # Base decay rate (higher = stronger locality)
         spatial_decay_radius=0.25,  # Base radius in normalized [-1,+1] space
         use_per_head_decay=True,  # ALiBi-style per-head decay (different heads = different locality)
+        decay_type='exponential',  # 'exponential' (natural signal decay) or 'linear' (original)
+        distance_type='l2',  # 'l2' (Euclidean) or 'l1' (Manhattan)
+        use_content_gate=True,  # Content-aware gating (SDT-style)
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -946,6 +1112,9 @@ class EqM(nn.Module):
             spatial_decay_rate=spatial_decay_rate,
             spatial_decay_radius=spatial_decay_radius,
             use_per_head_decay=use_per_head_decay,
+            decay_type=decay_type,
+            distance_type=distance_type,
+            use_content_gate=use_content_gate,
         )
 
         # Create blocks with layer indices for differential attention lambda initialization
@@ -1015,18 +1184,22 @@ class EqM(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x0, t, y, return_act=False, return_registers=False, get_energy=False, train=False):
+    def forward(self, x0, t, y, return_act=False, return_registers=False, get_energy=False, train=False,
+                return_attention=False, attention_layer_idx=-1):
         """
         Forward pass of EqM.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         return_registers: if True, also return the register token outputs for SIGReg
+        return_attention: if True, also return attention weights from specified layer
+        attention_layer_idx: which layer to extract attention from (-1 = last layer)
         """
         x0.requires_grad_(True)
         if self.uncond: # removes noise/time conditioning by setting to 0
             t = torch.zeros_like(t)
         act = []
+        attention_weights = None
         x = self.x_embedder(x0) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
 
         # Prepend register tokens (attention sinks)
@@ -1037,8 +1210,16 @@ class EqM(nn.Module):
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
-        for block in self.blocks:
-            x = block(x, c)                      # (N, num_reg + T, D)
+
+        # Determine which layer to extract attention from
+        num_blocks = len(self.blocks)
+        target_layer = attention_layer_idx if attention_layer_idx >= 0 else num_blocks + attention_layer_idx
+
+        for i, block in enumerate(self.blocks):
+            if return_attention and i == target_layer:
+                x, attention_weights = block(x, c, return_attention=True)
+            else:
+                x = block(x, c)
             act.append(x)
 
         # Split registers from patches before final layer
@@ -1068,6 +1249,14 @@ class EqM(nn.Module):
                 x = torch.autograd.grad([E.sum()],[x0],create_graph=train)[0]
         if get_energy:
             return x, -E
+        if return_attention:
+            if return_act:
+                if return_registers:
+                    return x, act, registers, attention_weights
+                return x, act, attention_weights
+            if return_registers:
+                return x, registers, attention_weights
+            return x, attention_weights
         if return_act:
             if return_registers:
                 return x, act, registers

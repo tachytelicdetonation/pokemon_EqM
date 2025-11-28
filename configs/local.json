@@ -40,5 +40,9 @@
     "use_spatial_decay": true,
     "spatial_decay_rate": 0.1,
     "spatial_decay_radius": 0.25,
-    "use_per_head_decay": true
+    "use_per_head_decay": true,
+    "decay_type": "learned",
+    "distance_type": "l2",
+    "use_content_gate": false,
+    "log_attention_every": 100
 }

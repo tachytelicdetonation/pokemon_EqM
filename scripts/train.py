@@ -39,6 +39,83 @@ import torch.nn.functional as F
 from torchmetrics.image.fid import FrechetInceptionDistance
 import math
 
+def log_attention_maps(model, sample_input, sample_t, sample_y, step, wandb_utils, num_registers=0, use_diff_attn=False):
+    """
+    Log attention maps from all heads to wandb.
+
+    Args:
+        model: EqM model (in eval mode)
+        sample_input: Sample input tensor [B, C, H, W]
+        sample_t: Timestep tensor [B]
+        sample_y: Class label tensor [B]
+        step: Current training step
+        wandb_utils: Wandb logging utility
+        num_registers: Number of register tokens
+        use_diff_attn: Whether using differential attention
+    """
+    import wandb
+
+    model.eval()
+    with torch.no_grad():
+        # Get attention from middle layer (usually most informative)
+        _, attn_weights = model(sample_input, sample_t, sample_y, return_attention=True, attention_layer_idx=len(model.blocks)//2)
+
+        # Handle differential attention format
+        if use_diff_attn and isinstance(attn_weights, dict):
+            attn1 = attn_weights['attn1']  # [B, num_heads, N, N]
+            attn2 = attn_weights['attn2']
+            lambda_val = attn_weights['lambda']
+            # Effective attention: attn1 - lambda * attn2
+            attn = attn1[0]  # Just use first sample, first attention matrix
+            attn2_vis = attn2[0]
+        else:
+            attn = attn_weights[0]  # [num_heads, N, N]
+            attn2_vis = None
+
+        num_heads = attn.shape[0]
+        N = attn.shape[1]
+
+        # Skip registers for visualization
+        if num_registers > 0:
+            attn = attn[:, num_registers:, num_registers:]
+            if attn2_vis is not None:
+                attn2_vis = attn2_vis[:, num_registers:, num_registers:]
+
+        num_patches = attn.shape[1]
+        H = W = int(num_patches ** 0.5)
+
+        # Visualize attention from center patch
+        center_idx = num_patches // 2
+
+        images = {}
+        for head_idx in range(num_heads):
+            # Attention from center to all patches
+            attn_from_center = attn[head_idx, center_idx].view(H, W)
+
+            # Normalize for visualization
+            attn_vis = attn_from_center - attn_from_center.min()
+            attn_vis = attn_vis / (attn_vis.max() + 1e-8)
+
+            images[f"attention/head_{head_idx:02d}"] = wandb.Image(
+                attn_vis.cpu().numpy(),
+                caption=f"Head {head_idx}"
+            )
+
+            # Also log attn2 for differential attention
+            if attn2_vis is not None:
+                attn2_from_center = attn2_vis[head_idx, center_idx].view(H, W)
+                attn2_norm = attn2_from_center - attn2_from_center.min()
+                attn2_norm = attn2_norm / (attn2_norm.max() + 1e-8)
+                images[f"attention_neg/head_{head_idx:02d}"] = wandb.Image(
+                    attn2_norm.cpu().numpy(),
+                    caption=f"Head {head_idx} (subtracted)"
+                )
+
+        wandb_utils.log(images, step=step)
+
+    model.train()
+
+
 class CenterCrop:
     def __init__(self, image_size):
         self.image_size = image_size
@@ -268,6 +345,9 @@ def main(args):
         spatial_decay_rate=getattr(args, 'spatial_decay_rate', 0.1),  # Base decay rate
         spatial_decay_radius=getattr(args, 'spatial_decay_radius', 0.25),  # Base radius in normalized space
         use_per_head_decay=getattr(args, 'use_per_head_decay', True),  # ALiBi-style per-head decay
+        decay_type=getattr(args, 'decay_type', 'exponential'),  # 'exponential' or 'linear' decay
+        distance_type=getattr(args, 'distance_type', 'l2'),  # 'l2' (Euclidean) or 'l1' (Manhattan)
+        use_content_gate=getattr(args, 'use_content_gate', True),  # Content-aware gating (SDT-style)
     ).to(device)
 
     # Note that parameter initialization is done within the EqM constructor
@@ -522,6 +602,22 @@ def main(args):
                 running_loss = 0
                 log_steps = 0
                 start_time = time()
+
+            # Log attention maps periodically
+            log_attention_every = getattr(args, 'log_attention_every', 0)
+            if args.wandb and log_attention_every > 0 and train_steps % log_attention_every == 0 and train_steps > 0:
+                logger.info(f"Logging attention maps at step {train_steps}...")
+                # Use a sample from current batch for attention visualization
+                with torch.no_grad():
+                    sample_x = x[:1].to(device)  # Just first sample
+                    sample_t_attn = torch.rand(1, device=device)
+                    sample_y_attn = y[:1].to(device)
+                    log_attention_maps(
+                        model, sample_x, sample_t_attn, sample_y_attn,
+                        train_steps, wandb_utils,
+                        num_registers=getattr(args, 'num_registers', 0),
+                        use_diff_attn=getattr(args, 'use_diff_attn', False)
+                    )
 
             # Save EqM checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
