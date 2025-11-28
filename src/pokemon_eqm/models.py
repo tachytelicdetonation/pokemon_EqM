@@ -236,6 +236,83 @@ class LearnedSpatialDecay(nn.Module):
             return decay_sym * dist.unsqueeze(0).unsqueeze(0) * alpha
 
 
+class MatrixGatedLambda(nn.Module):
+    """
+    M-DGSA: Content-dependent N×N lambda matrix from Q and K.
+
+    Instead of a single scalar lambda applied uniformly, computes a per-position-pair
+    lambda value based on query-key content, enabling content-dependent noise cancellation.
+
+    Formula:
+        lambda[i,j] = lambda_init + scale * (sigmoid(logits[i,j] / temp) - 0.5)
+        where logits[i,j] = q_i @ W_q + k_j @ W_k + sum_d(W_qk[d] * q[i,d] * k[j,d])
+
+    Reference: M-DGSA extends Microsoft Diff-Transformer (arXiv:2410.05258)
+    """
+    def __init__(self, head_dim, num_heads, lambda_init=0.5, scale=1.0, use_qk_interaction=True):
+        super().__init__()
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.lambda_init = lambda_init
+        self.scale = scale
+        self.use_qk_interaction = use_qk_interaction
+
+        # Query and key contributions to gating logits
+        self.W_q = nn.Parameter(torch.zeros(num_heads, head_dim))
+        self.W_k = nn.Parameter(torch.zeros(num_heads, head_dim))
+
+        # QK multiplicative interaction for richer content modeling
+        if use_qk_interaction:
+            self.W_qk = nn.Parameter(torch.zeros(num_heads, head_dim))
+
+        # Per-head learnable bias and temperature
+        self.bias = nn.Parameter(torch.zeros(num_heads))
+        self.temperature = nn.Parameter(torch.ones(num_heads))
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights small so lambda starts near lambda_init."""
+        nn.init.normal_(self.W_q, std=0.01)
+        nn.init.normal_(self.W_k, std=0.01)
+        if self.use_qk_interaction:
+            nn.init.normal_(self.W_qk, std=0.01)
+
+    def forward(self, q1, k1):
+        """
+        Compute N×N lambda gating matrix.
+
+        Args:
+            q1: Query tensor [B, num_heads, N, head_dim]
+            k1: Key tensor [B, num_heads, N, head_dim]
+
+        Returns:
+            lambda_matrix: [B, num_heads, N, N] content-dependent lambda values
+        """
+        # Compute per-query and per-key contributions
+        q_logits = torch.einsum('bhnd,hd->bhn', q1, self.W_q)  # [B, H, N]
+        k_logits = torch.einsum('bhnd,hd->bhn', k1, self.W_k)  # [B, H, N]
+
+        # Broadcast to [B, H, N, N]: outer sum
+        logits = q_logits.unsqueeze(-1) + k_logits.unsqueeze(-2)
+
+        # Add QK multiplicative interaction if enabled
+        if self.use_qk_interaction:
+            # Bilinear interaction: sum_d W_qk[h,d] * q[b,h,i,d] * k[b,h,j,d]
+            qk_interaction = torch.einsum('bhid,bhjd,hd->bhij', q1, k1, self.W_qk)
+            logits = logits + qk_interaction
+
+        # Add per-head bias
+        logits = logits + self.bias.view(1, -1, 1, 1)
+
+        # Apply temperature-scaled sigmoid
+        temp = self.temperature.view(1, -1, 1, 1).clamp(min=0.1)
+        gate = torch.sigmoid(logits / temp)
+
+        # Scale to [lambda_init - scale/2, lambda_init + scale/2]
+        return self.lambda_init + self.scale * (gate - 0.5)
+
+
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
@@ -787,6 +864,9 @@ class DifferentialAttention(nn.Module):
         decay_type='exponential',  # 'exponential', 'linear', or 'learned' (SDT-style)
         distance_type='l2',  # 'l2' (Euclidean) or 'l1' (Manhattan)
         use_content_gate=True,  # Content-aware gating (only for non-learned decay)
+        use_matrix_lambda=False,  # M-DGSA: use content-dependent N×N lambda matrix
+        matrix_lambda_scale=1.0,  # Scale for lambda range around lambda_init
+        matrix_lambda_use_qk=True,  # Include QK multiplicative interaction in lambda
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -805,6 +885,9 @@ class DifferentialAttention(nn.Module):
         self.decay_type = decay_type
         self.distance_type = distance_type
         self.use_content_gate = use_content_gate
+        self.use_matrix_lambda = use_matrix_lambda
+        self.matrix_lambda_scale = matrix_lambda_scale
+        self.matrix_lambda_use_qk = matrix_lambda_use_qk
 
         # Q, K, V projections (same total dimension as standard attention)
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -818,12 +901,24 @@ class DifferentialAttention(nn.Module):
         elif use_content_gate and use_spatial_decay:
             self.content_gate = LearnedSpatialDecay(self.head_dim, num_heads, distance_type)
 
-        # Learnable lambda parameters for differential attention
+        # Lambda parameters for differential attention
         self.lambda_init = lambda_init_fn(layer_idx)
-        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
-        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
-        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
-        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
+
+        if use_matrix_lambda:
+            # M-DGSA: Content-dependent N×N lambda matrix
+            self.matrix_lambda = MatrixGatedLambda(
+                head_dim=self.head_dim,
+                num_heads=num_heads,
+                lambda_init=self.lambda_init,
+                scale=matrix_lambda_scale,
+                use_qk_interaction=matrix_lambda_use_qk
+            )
+        else:
+            # Original scalar lambda parameters
+            self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
+            self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
+            self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
+            self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim).normal_(mean=0, std=0.1))
 
         # SubLayer normalization (RMSNorm as per the paper)
         self.subln = RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
@@ -956,13 +1051,22 @@ class DifferentialAttention(nn.Module):
         out1 = attn1 @ v  # [B, num_heads, N, 2*head_dim]
         out2 = attn2 @ v
 
-        # Compute lambda value
-        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1))
-        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1))
-        lambda_full = lambda_1 - lambda_2 + self.lambda_init
-
-        # Differential attention: subtract weighted second attention
-        out = out1 - lambda_full * out2  # [B, num_heads, N, 2*head_dim]
+        # Compute lambda and apply differential attention
+        if self.use_matrix_lambda:
+            # M-DGSA: Content-dependent N×N lambda matrix
+            lambda_matrix = self.matrix_lambda(q1, k1)  # [B, num_heads, N, N]
+            # Apply matrix lambda element-wise to second attention before value aggregation
+            weighted_attn2 = lambda_matrix * attn2  # [B, num_heads, N, N]
+            out2_weighted = weighted_attn2 @ v  # [B, num_heads, N, 2*head_dim]
+            out = out1 - out2_weighted
+            lambda_for_return = lambda_matrix
+        else:
+            # Original scalar lambda computation
+            lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1))
+            lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1))
+            lambda_full = lambda_1 - lambda_2 + self.lambda_init
+            out = out1 - lambda_full * out2  # [B, num_heads, N, 2*head_dim]
+            lambda_for_return = lambda_full
 
         # Apply sublayer normalization and scaling
         out = out.permute(0, 2, 1, 3)  # [B, N, num_heads, 2*head_dim]
@@ -976,7 +1080,7 @@ class DifferentialAttention(nn.Module):
 
         if return_attention:
             # Return both attention matrices for differential attention visualization
-            return out, {'attn1': attn1_weights, 'attn2': attn2_weights, 'lambda': lambda_full}
+            return out, {'attn1': attn1_weights, 'attn2': attn2_weights, 'lambda': lambda_for_return}
         return out
 
 
@@ -996,7 +1100,12 @@ class SiTBlock(nn.Module):
                 layer_idx=layer_idx, **block_kwargs
             )
         else:
-            self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+            # Filter out differential attention-specific kwargs for standard Attention
+            diff_attn_keys = {'use_spatial_decay', 'spatial_decay_rate', 'spatial_decay_radius',
+                            'use_per_head_decay', 'decay_type', 'distance_type', 'use_content_gate',
+                            'use_matrix_lambda', 'matrix_lambda_scale', 'matrix_lambda_use_qk'}
+            attn_kwargs = {k: v for k, v in block_kwargs.items() if k not in diff_attn_keys}
+            self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **attn_kwargs)
 
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -1074,6 +1183,9 @@ class EqM(nn.Module):
         decay_type='exponential',  # 'exponential' (natural signal decay) or 'linear' (original)
         distance_type='l2',  # 'l2' (Euclidean) or 'l1' (Manhattan)
         use_content_gate=True,  # Content-aware gating (SDT-style)
+        use_matrix_lambda=False,  # M-DGSA: use content-dependent N×N lambda matrix
+        matrix_lambda_scale=1.0,  # Scale for lambda range around lambda_init
+        matrix_lambda_use_qk=True,  # Include QK multiplicative interaction in lambda
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -1115,6 +1227,9 @@ class EqM(nn.Module):
             decay_type=decay_type,
             distance_type=distance_type,
             use_content_gate=use_content_gate,
+            use_matrix_lambda=use_matrix_lambda,
+            matrix_lambda_scale=matrix_lambda_scale,
+            matrix_lambda_use_qk=matrix_lambda_use_qk,
         )
 
         # Create blocks with layer indices for differential attention lambda initialization

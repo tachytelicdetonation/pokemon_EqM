@@ -3,11 +3,10 @@ import torch
 import sys
 import os
 
-# Add parent directory to path to import modules
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Add src directory to path for proper imports
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
-from models import EqM_models
-import generate_pokemon # This verifies syntax of generate_pokemon.py
+from pokemon_eqm.models import EqM_models
 
 def test_model_forward():
     print("Testing EqM model forward pass...")
