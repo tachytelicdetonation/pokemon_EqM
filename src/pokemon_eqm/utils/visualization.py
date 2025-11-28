@@ -814,15 +814,6 @@ class AttentionVisualizer:
             self.create_gif(self._sample_frames, path, fps=5, desc="Saving samples GIF")
             gifs['samples_evolution'] = path
 
-        # Create metrics history plot as final frame
-        if self.metrics_history:
-            last_step = max(h[-1][0] for h in self.metrics_history.values() if h)
-            metrics_plot = self.create_metrics_plot(last_step)
-            img = Image.fromarray(metrics_plot)
-            path = str(output_dir / f'metrics_history{suffix}.png')
-            img.save(path)
-            gifs['metrics_history'] = path
-
         return gifs
 
     def clear_data(self):
