@@ -723,7 +723,7 @@ def main(args):
                     if sampling_method in ["gd", "ngd"]:
                         m = torch.zeros_like(xt)
                         with torch.no_grad():
-                            for i in tqdm(range(num_steps - 1), desc=f"Sampling ({sampling_method})", leave=False):
+                            for i in range(num_steps - 1):
                                 if sampling_method == 'gd':
                                     out = model_fn(xt, t, y, args.cfg_scale) if use_cfg else model_fn(xt, t, y)
                                     if not torch.is_tensor(out):
