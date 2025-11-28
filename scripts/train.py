@@ -1125,6 +1125,10 @@ def main(args):
                         # Reset metrics
                         fid_metric.reset()
 
+                # Clear CUDA cache after FID to prevent OOM during training resume
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
                 model.train()
 
     model.eval()  # important! This disables randomized embedding dropout
