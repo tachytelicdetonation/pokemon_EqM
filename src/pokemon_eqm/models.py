@@ -236,6 +236,104 @@ class LearnedSpatialDecay(nn.Module):
             return decay_sym * dist.unsqueeze(0).unsqueeze(0) * alpha
 
 
+class OutputGate(nn.Module):
+    """
+    G1 Output Gating for Attention Sink Elimination.
+
+    Applies a head-specific, query-dependent sigmoid gate AFTER the attention computation,
+    allowing the model to output "nothing" (sparse outputs) instead of being forced to
+    attend somewhere due to softmax normalization.
+
+    This eliminates attention sinks by breaking the sum-to-1 constraint at the output level.
+
+    Formula:
+        gate[b,h,n] = sigmoid((q_mean[b,h,n] @ W_gate + bias) / temperature)
+        output = gate * attention_output
+
+    When gate ≈ 0, the position outputs near-zero regardless of attention weights.
+
+    Reference: "Gated Attention" (arXiv:2505.06708) - May 2025
+    """
+    def __init__(self, head_dim, num_heads, gate_init_bias=-2.0, temperature=1.0, gate_type='per_token'):
+        """
+        Args:
+            head_dim: Dimension per attention head
+            num_heads: Number of attention heads
+            gate_init_bias: Initial bias (negative = gates start more closed, conservative)
+            temperature: Temperature for sigmoid (higher = softer gates)
+            gate_type: 'per_token' (N gates), 'per_head' (num_heads gates), or 'global' (1 gate)
+        """
+        super().__init__()
+        self.head_dim = head_dim
+        self.num_heads = num_heads
+        self.temperature = temperature
+        self.gate_type = gate_type
+
+        # Query projection to gate logits
+        if gate_type == 'per_token':
+            # Per-token, per-head gating: most expressive
+            self.gate_proj = nn.Linear(head_dim, 1, bias=False)
+            self.gate_bias = nn.Parameter(torch.full((num_heads,), gate_init_bias))
+        elif gate_type == 'per_head':
+            # Per-head gating only: simpler, less parameters
+            self.gate_proj = nn.Linear(head_dim, 1, bias=False)
+            self.gate_bias = nn.Parameter(torch.full((num_heads,), gate_init_bias))
+        else:  # global
+            # Single global gate: simplest
+            self.gate_bias = nn.Parameter(torch.tensor(gate_init_bias))
+
+        # Learnable temperature per head for adaptive sharpness
+        self.learned_temp = nn.Parameter(torch.ones(num_heads) * temperature)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize gate projection small so gates start near sigmoid(bias)."""
+        if hasattr(self, 'gate_proj'):
+            nn.init.normal_(self.gate_proj.weight, std=0.01)
+
+    def forward(self, q, out, num_registers=0):
+        """
+        Compute and apply output gate.
+
+        Args:
+            q: Query tensor [B, num_heads, N, head_dim]
+            out: Attention output [B, num_heads, N, out_dim]
+            num_registers: Number of register tokens (always get gate=1, no suppression)
+
+        Returns:
+            Gated output [B, num_heads, N, out_dim]
+        """
+        B, num_heads, N, _ = q.shape
+
+        # Compute gate logits
+        if self.gate_type == 'per_token':
+            # Project query to scalar per token
+            gate_logits = self.gate_proj(q).squeeze(-1)  # [B, H, N]
+            gate_logits = gate_logits + self.gate_bias.view(1, num_heads, 1)
+        elif self.gate_type == 'per_head':
+            # Average query across tokens, then project
+            q_mean = q.mean(dim=2)  # [B, H, head_dim]
+            gate_logits = self.gate_proj(q_mean).squeeze(-1)  # [B, H]
+            gate_logits = gate_logits + self.gate_bias
+            gate_logits = gate_logits.unsqueeze(-1).expand(-1, -1, N)  # [B, H, N]
+        else:  # global
+            gate_logits = self.gate_bias.expand(B, num_heads, N)
+
+        # Apply temperature-scaled sigmoid
+        temp = self.learned_temp.view(1, num_heads, 1).clamp(min=0.1)
+        gate = torch.sigmoid(gate_logits / temp)  # [B, H, N]
+
+        # Register tokens should never be gated (they're meant to absorb attention)
+        if num_registers > 0:
+            gate = gate.clone()
+            gate[:, :, :num_registers] = 1.0
+
+        # Apply gate to output
+        gate = gate.unsqueeze(-1)  # [B, H, N, 1]
+        return out * gate
+
+
 class MatrixGatedLambda(nn.Module):
     """
     M-DGSA: Content-dependent N×N lambda matrix from Q and K.
@@ -680,6 +778,9 @@ class Attention(nn.Module):
         decay_type='exponential',  # 'exponential', 'linear', or 'learned' (SDT-style)
         distance_type='l2',  # 'l2' (Euclidean) or 'l1' (Manhattan)
         use_content_gate=True,  # Content-aware gating (only for non-learned decay)
+        use_output_gate=False,  # G1 output gating for attention sink elimination
+        output_gate_type='per_token',  # 'per_token', 'per_head', or 'global'
+        output_gate_init_bias=-2.0,  # Initial bias (negative = conservative, gates start more open)
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -696,6 +797,7 @@ class Attention(nn.Module):
         self.decay_type = decay_type
         self.distance_type = distance_type
         self.use_content_gate = use_content_gate
+        self.use_output_gate = use_output_gate
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
@@ -708,6 +810,15 @@ class Attention(nn.Module):
         elif use_content_gate and use_spatial_decay:
             # Legacy content-aware gate for non-learned decay types
             self.content_gate = LearnedSpatialDecay(head_dim, num_heads, distance_type)
+
+        # G1 Output Gating for attention sink elimination (arXiv:2505.06708)
+        if use_output_gate:
+            self.output_gate = OutputGate(
+                head_dim=head_dim,
+                num_heads=num_heads,
+                gate_init_bias=output_gate_init_bias,
+                gate_type=output_gate_type
+            )
 
         if self.use_liere:
             self.liere = LieRE(
@@ -792,7 +903,14 @@ class Attention(nn.Module):
         attn_weights = attn  # Save for visualization before dropout
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # Compute attention output
+        out = attn @ v  # [B, num_heads, N, head_dim]
+
+        # Apply G1 output gating if enabled (attention sink elimination)
+        if self.use_output_gate:
+            out = self.output_gate(q, out, num_registers=self.num_registers)
+
+        x = out.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
@@ -867,6 +985,9 @@ class DifferentialAttention(nn.Module):
         use_matrix_lambda=False,  # M-DGSA: use content-dependent N×N lambda matrix
         matrix_lambda_scale=1.0,  # Scale for lambda range around lambda_init
         matrix_lambda_use_qk=True,  # Include QK multiplicative interaction in lambda
+        use_output_gate=False,  # G1 output gating for attention sink elimination
+        output_gate_type='per_token',  # 'per_token', 'per_head', or 'global'
+        output_gate_init_bias=-2.0,  # Initial bias (negative = conservative, gates start more open)
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -888,6 +1009,7 @@ class DifferentialAttention(nn.Module):
         self.use_matrix_lambda = use_matrix_lambda
         self.matrix_lambda_scale = matrix_lambda_scale
         self.matrix_lambda_use_qk = matrix_lambda_use_qk
+        self.use_output_gate = use_output_gate
 
         # Q, K, V projections (same total dimension as standard attention)
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -933,6 +1055,16 @@ class DifferentialAttention(nn.Module):
                 pos_embed_shift=liere_pos_embed_shift,
                 pos_embed_jitter=liere_pos_embed_jitter,
                 pos_embed_rescale=liere_pos_embed_rescale
+            )
+
+        # G1 Output Gating for attention sink elimination (arXiv:2505.06708)
+        # Note: For differential attention, output dim is 2*head_dim
+        if use_output_gate:
+            self.output_gate = OutputGate(
+                head_dim=self.head_dim,
+                num_heads=num_heads,
+                gate_init_bias=output_gate_init_bias,
+                gate_type=output_gate_type
             )
 
     def forward(self, x, return_attention=False):
@@ -1068,6 +1200,11 @@ class DifferentialAttention(nn.Module):
             out = out1 - lambda_full * out2  # [B, num_heads, N, 2*head_dim]
             lambda_for_return = lambda_full
 
+        # Apply G1 output gating if enabled (attention sink elimination)
+        # This allows the model to output "nothing" for positions where attention is uninformative
+        if self.use_output_gate:
+            out = self.output_gate(q1, out, num_registers=self.num_registers)
+
         # Apply sublayer normalization and scaling
         out = out.permute(0, 2, 1, 3)  # [B, N, num_heads, 2*head_dim]
         out = self.subln(out)
@@ -1186,6 +1323,9 @@ class EqM(nn.Module):
         use_matrix_lambda=False,  # M-DGSA: use content-dependent N×N lambda matrix
         matrix_lambda_scale=1.0,  # Scale for lambda range around lambda_init
         matrix_lambda_use_qk=True,  # Include QK multiplicative interaction in lambda
+        use_output_gate=False,  # G1 output gating for attention sink elimination (arXiv:2505.06708)
+        output_gate_type='per_token',  # 'per_token', 'per_head', or 'global'
+        output_gate_init_bias=-2.0,  # Initial bias (negative = conservative, gates start more open)
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -1230,6 +1370,9 @@ class EqM(nn.Module):
             use_matrix_lambda=use_matrix_lambda,
             matrix_lambda_scale=matrix_lambda_scale,
             matrix_lambda_use_qk=matrix_lambda_use_qk,
+            use_output_gate=use_output_gate,
+            output_gate_type=output_gate_type,
+            output_gate_init_bias=output_gate_init_bias,
         )
 
         # Create blocks with layer indices for differential attention lambda initialization
