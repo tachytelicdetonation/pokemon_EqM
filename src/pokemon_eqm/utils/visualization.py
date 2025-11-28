@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 import io
 from PIL import Image
+from tqdm import tqdm
 
 
 class AttentionVisualizer:
@@ -480,11 +481,20 @@ class AttentionVisualizer:
 
     def generate_frames_from_data(self):
         """Convert stored raw data into visualization frames for GIF generation."""
+        total_frames = (len(self.attention_data) + len(self.diff_attn_data) +
+                       len(self.entropy_data) + len(self.similarity_data) + len(self.sample_data))
+
+        if total_frames == 0:
+            return
+
+        pbar = tqdm(total=total_frames, desc="Generating GIF frames", leave=False)
+
         # Generate attention frames
         self._attention_frames = []
         for step, attn_np in self.attention_data:
             frame = self.create_attention_grid_from_numpy(attn_np, step, self._num_registers)
             self._attention_frames.append((step, frame))
+            pbar.update(1)
 
         # Generate differential attention frames
         self._diff_attn_frames = []
@@ -493,24 +503,30 @@ class AttentionVisualizer:
                 data['attn1'], data['attn2'], step, self._num_registers
             )
             self._diff_attn_frames.append((step, frame))
+            pbar.update(1)
 
         # Generate entropy frames
         self._entropy_frames = []
         for step, entropy_np in self.entropy_data:
             frame = self.create_entropy_chart_from_numpy(entropy_np, step)
             self._entropy_frames.append((step, frame))
+            pbar.update(1)
 
         # Generate similarity frames
         self._similarity_frames = []
         for step, sim_np in self.similarity_data:
             frame = self.create_similarity_matrix_from_numpy(sim_np, step)
             self._similarity_frames.append((step, frame))
+            pbar.update(1)
 
         # Generate sample frames
         self._sample_frames = []
         for step, samples_np in self.sample_data:
             frame = self.create_sample_grid(samples_np, step)
             self._sample_frames.append((step, frame))
+            pbar.update(1)
+
+        pbar.close()
 
     def create_gif(
         self,
