@@ -533,7 +533,8 @@ class AttentionVisualizer:
         frames: List[Tuple[int, np.ndarray]],
         output_path: str,
         fps: int = 10,
-        loop: int = 0
+        loop: int = 0,
+        desc: str = "Creating GIF"
     ) -> str:
         """
         Create GIF from frames.
@@ -543,6 +544,7 @@ class AttentionVisualizer:
             output_path: Path to save GIF
             fps: Frames per second
             loop: Number of loops (0 = infinite)
+            desc: Description for progress bar
 
         Returns:
             Path to saved GIF
@@ -550,7 +552,9 @@ class AttentionVisualizer:
         if not frames:
             return None
 
-        images = [Image.fromarray(frame[1]) for frame in frames]
+        images = []
+        for frame in tqdm(frames, desc=desc, leave=False):
+            images.append(Image.fromarray(frame[1]))
 
         # Resize to consistent size (use first frame as reference)
         target_size = images[0].size
@@ -591,27 +595,27 @@ class AttentionVisualizer:
 
         if self._attention_frames:
             path = str(output_dir / f'attention_grid{suffix}.gif')
-            self.create_gif(self._attention_frames, path, fps=8)
+            self.create_gif(self._attention_frames, path, fps=8, desc="Saving attention GIF")
             gifs['attention_grid'] = path
 
         if self._diff_attn_frames:
             path = str(output_dir / f'diff_attention_grid{suffix}.gif')
-            self.create_gif(self._diff_attn_frames, path, fps=8)
+            self.create_gif(self._diff_attn_frames, path, fps=8, desc="Saving diff_attn GIF")
             gifs['diff_attention_grid'] = path
 
         if self._entropy_frames:
             path = str(output_dir / f'entropy_evolution{suffix}.gif')
-            self.create_gif(self._entropy_frames, path, fps=8)
+            self.create_gif(self._entropy_frames, path, fps=8, desc="Saving entropy GIF")
             gifs['entropy_evolution'] = path
 
         if self._similarity_frames:
             path = str(output_dir / f'similarity_evolution{suffix}.gif')
-            self.create_gif(self._similarity_frames, path, fps=8)
+            self.create_gif(self._similarity_frames, path, fps=8, desc="Saving similarity GIF")
             gifs['similarity_evolution'] = path
 
         if self._sample_frames:
             path = str(output_dir / f'samples_evolution{suffix}.gif')
-            self.create_gif(self._sample_frames, path, fps=5)
+            self.create_gif(self._sample_frames, path, fps=5, desc="Saving samples GIF")
             gifs['samples_evolution'] = path
 
         # Create metrics history plot as final frame
