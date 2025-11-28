@@ -11,7 +11,7 @@ from PIL import Image
 
 
 class AttentionVisualizer:
-    """Collects attention visualizations during training for GIF generation."""
+    """Collects attention data during training for GIF generation at checkpoints."""
 
     def __init__(self, save_dir: Optional[str] = None, max_frames: int = 500):
         """
@@ -22,12 +22,21 @@ class AttentionVisualizer:
         self.save_dir = Path(save_dir) if save_dir else None
         self.max_frames = max_frames
 
-        # Storage for GIF frames
-        self.attention_frames: List[Tuple[int, np.ndarray]] = []  # (step, image)
-        self.entropy_frames: List[Tuple[int, np.ndarray]] = []
-        self.similarity_frames: List[Tuple[int, np.ndarray]] = []
-        self.sample_frames: List[Tuple[int, np.ndarray]] = []
+        # Storage for raw data (converted to frames at checkpoint time)
+        self.attention_data: List[Tuple[int, np.ndarray]] = []  # (step, attn_weights)
+        self.diff_attn_data: List[Tuple[int, Dict[str, np.ndarray]]] = []  # (step, {attn1, attn2})
+        self.entropy_data: List[Tuple[int, np.ndarray]] = []  # (step, per_head_entropy)
+        self.similarity_data: List[Tuple[int, np.ndarray]] = []  # (step, similarity_matrix)
+        self.sample_data: List[Tuple[int, np.ndarray]] = []  # (step, samples)
         self.metrics_history: Dict[str, List[Tuple[int, float]]] = {}
+
+        # Cached frames for GIF generation (generated at checkpoint)
+        self._attention_frames: List[Tuple[int, np.ndarray]] = []
+        self._diff_attn_frames: List[Tuple[int, np.ndarray]] = []
+        self._entropy_frames: List[Tuple[int, np.ndarray]] = []
+        self._similarity_frames: List[Tuple[int, np.ndarray]] = []
+        self._sample_frames: List[Tuple[int, np.ndarray]] = []
+        self._num_registers: int = 0
 
         if self.save_dir:
             self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -213,31 +222,133 @@ class AttentionVisualizer:
         plt.close(fig)
         return arr
 
+    def store_attention_data(self, attn: torch.Tensor, step: int, num_registers: int = 0):
+        """Store raw attention data for later visualization."""
+        self._num_registers = num_registers
+        attn_np = attn.detach().cpu().numpy()
+        self._add_frame(self.attention_data, step, attn_np)
+
+    def store_diff_attention_data(self, attn1: torch.Tensor, attn2: torch.Tensor, step: int, num_registers: int = 0):
+        """Store raw differential attention data for later visualization."""
+        self._num_registers = num_registers
+        data = {
+            'attn1': attn1.detach().cpu().numpy(),
+            'attn2': attn2.detach().cpu().numpy()
+        }
+        self._add_frame(self.diff_attn_data, step, data)
+
+    def store_entropy_data(self, per_head_entropy: torch.Tensor, step: int):
+        """Store raw entropy data for later visualization."""
+        entropy_np = per_head_entropy.detach().cpu().numpy()
+        self._add_frame(self.entropy_data, step, entropy_np)
+
+    def store_similarity_data(self, sim_matrix: torch.Tensor, step: int):
+        """Store raw similarity matrix data for later visualization."""
+        sim_np = sim_matrix.detach().cpu().numpy()
+        self._add_frame(self.similarity_data, step, sim_np)
+
+    def store_sample_data(self, samples: Union[torch.Tensor, np.ndarray], step: int):
+        """Store raw sample data for later visualization."""
+        if isinstance(samples, torch.Tensor):
+            samples = samples.detach().cpu().numpy()
+        self._add_frame(self.sample_data, step, samples)
+
+    # Legacy methods for backward compatibility
     def add_attention_frame(self, attn: torch.Tensor, step: int, num_registers: int = 0):
-        """Add attention visualization frame."""
-        frame = self.create_attention_grid(attn, step, num_registers)
-        self._add_frame(self.attention_frames, step, frame)
+        """Add attention visualization frame (legacy - stores data now)."""
+        self.store_attention_data(attn, step, num_registers)
 
     def add_entropy_frame(self, per_head_entropy: torch.Tensor, step: int):
-        """Add entropy chart frame."""
-        frame = self.create_entropy_chart(per_head_entropy, step)
-        self._add_frame(self.entropy_frames, step, frame)
+        """Add entropy chart frame (legacy - stores data now)."""
+        self.store_entropy_data(per_head_entropy, step)
 
     def add_similarity_frame(self, sim_matrix: torch.Tensor, step: int):
-        """Add similarity matrix frame."""
-        frame = self.create_similarity_matrix(sim_matrix, step)
-        self._add_frame(self.similarity_frames, step, frame)
+        """Add similarity matrix frame (legacy - stores data now)."""
+        self.store_similarity_data(sim_matrix, step)
 
     def add_sample_frame(self, samples: Union[torch.Tensor, np.ndarray], step: int):
+        """Add generated samples frame (legacy - stores data now)."""
+        self.store_sample_data(samples, step)
+
+    def create_diff_attention_grid(
+        self,
+        attn1: np.ndarray,
+        attn2: np.ndarray,
+        step: int,
+        num_registers: int = 0,
+    ) -> np.ndarray:
         """
-        Add generated samples frame.
+        Create a grid visualization for differential attention (attn1 and attn2 side by side).
 
         Args:
-            samples: [N, C, H, W] or [N, H, W, C] image tensor/array
-        """
-        if isinstance(samples, torch.Tensor):
-            samples = samples.cpu().numpy()
+            attn1: [num_heads, N, N] primary attention weights
+            attn2: [num_heads, N, N] subtracted attention weights
+            step: Current training step
+            num_registers: Number of register tokens to skip
 
+        Returns:
+            Image as numpy array
+        """
+        if num_registers > 0:
+            attn1 = attn1[:, num_registers:, num_registers:]
+            attn2 = attn2[:, num_registers:, num_registers:]
+
+        num_heads = attn1.shape[0]
+        num_patches = attn1.shape[1]
+        H = W = int(num_patches ** 0.5)
+        center_idx = num_patches // 2
+
+        # Create grid layout: 2 columns per head (attn1, attn2)
+        cols = min(4, num_heads)  # Max 4 heads per row
+        rows = (num_heads + cols - 1) // cols
+
+        fig, axes = plt.subplots(rows * 2, cols, figsize=(3 * cols, 3 * rows * 2))
+        if rows * 2 == 1 and cols == 1:
+            axes = np.array([[axes]])
+        elif rows * 2 == 1:
+            axes = axes.reshape(1, -1)
+        elif cols == 1:
+            axes = axes.reshape(-1, 1)
+
+        fig.suptitle(f'Differential Attention (Step {step})\nTop: Primary (A1), Bottom: Subtracted (A2)', fontsize=12)
+
+        for head_idx in range(num_heads):
+            row_base = (head_idx // cols) * 2
+            col = head_idx % cols
+
+            # Primary attention (attn1)
+            ax1 = axes[row_base, col]
+            attn1_from_center = attn1[head_idx, center_idx].reshape(H, W)
+            attn1_vis = attn1_from_center - attn1_from_center.min()
+            attn1_vis = attn1_vis / (attn1_vis.max() + 1e-8)
+            ax1.imshow(attn1_vis, cmap='viridis', vmin=0, vmax=1)
+            ax1.set_title(f'H{head_idx} A1', fontsize=9)
+            ax1.axis('off')
+
+            # Subtracted attention (attn2)
+            ax2 = axes[row_base + 1, col]
+            attn2_from_center = attn2[head_idx, center_idx].reshape(H, W)
+            attn2_vis = attn2_from_center - attn2_from_center.min()
+            attn2_vis = attn2_vis / (attn2_vis.max() + 1e-8)
+            ax2.imshow(attn2_vis, cmap='magma', vmin=0, vmax=1)
+            ax2.set_title(f'H{head_idx} A2', fontsize=9)
+            ax2.axis('off')
+
+        # Hide empty subplots
+        for idx in range(num_heads, (rows) * cols):
+            row_base = (idx // cols) * 2
+            col = idx % cols
+            if row_base < axes.shape[0] and col < axes.shape[1]:
+                axes[row_base, col].axis('off')
+                axes[row_base + 1, col].axis('off')
+
+        plt.tight_layout()
+        arr = self._fig_to_array(fig)
+        plt.close(fig)
+        return arr
+
+    def create_sample_grid(self, samples: np.ndarray, step: int) -> np.ndarray:
+        """Create sample grid image from numpy array."""
         # Handle different formats
         if samples.ndim == 4:
             if samples.shape[1] in [1, 3, 4]:  # [N, C, H, W]
@@ -280,8 +391,126 @@ class AttentionVisualizer:
         plt.tight_layout()
         arr = self._fig_to_array(fig)
         plt.close(fig)
+        return arr
 
-        self._add_frame(self.sample_frames, step, arr)
+    def create_attention_grid_from_numpy(
+        self,
+        attn: np.ndarray,
+        step: int,
+        num_registers: int = 0,
+        title_prefix: str = ""
+    ) -> np.ndarray:
+        """Create attention grid from numpy array (internal use)."""
+        if num_registers > 0:
+            attn = attn[:, num_registers:, num_registers:]
+
+        num_heads = attn.shape[0]
+        num_patches = attn.shape[1]
+        H = W = int(num_patches ** 0.5)
+        center_idx = num_patches // 2
+
+        cols = min(4, num_heads)
+        rows = (num_heads + cols - 1) // cols
+
+        fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows))
+        if rows == 1 and cols == 1:
+            axes = np.array([[axes]])
+        elif rows == 1:
+            axes = axes.reshape(1, -1)
+        elif cols == 1:
+            axes = axes.reshape(-1, 1)
+
+        fig.suptitle(f'{title_prefix}Attention from Center (Step {step})', fontsize=14)
+
+        for head_idx in range(num_heads):
+            row, col = head_idx // cols, head_idx % cols
+            ax = axes[row, col]
+
+            attn_from_center = attn[head_idx, center_idx].reshape(H, W)
+            attn_vis = attn_from_center - attn_from_center.min()
+            attn_vis = attn_vis / (attn_vis.max() + 1e-8)
+
+            ax.imshow(attn_vis, cmap='viridis', vmin=0, vmax=1)
+            ax.set_title(f'Head {head_idx}', fontsize=10)
+            ax.axis('off')
+
+        for idx in range(num_heads, rows * cols):
+            row, col = idx // cols, idx % cols
+            axes[row, col].axis('off')
+
+        plt.tight_layout()
+        arr = self._fig_to_array(fig)
+        plt.close(fig)
+        return arr
+
+    def create_entropy_chart_from_numpy(self, per_head_entropy: np.ndarray, step: int) -> np.ndarray:
+        """Create entropy chart from numpy array (internal use)."""
+        fig, ax = plt.subplots(figsize=(10, 4))
+        bars = ax.bar(range(len(per_head_entropy)), per_head_entropy, color='steelblue', edgecolor='navy')
+        ax.set_xlabel('Head Index')
+        ax.set_ylabel('Entropy')
+        ax.set_title(f'Per-Head Attention Entropy (Step {step})')
+        mean_ent = per_head_entropy.mean()
+        ax.axhline(y=mean_ent, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_ent:.3f}')
+        ax.legend()
+        ax.set_xticks(range(len(per_head_entropy)))
+        plt.tight_layout()
+
+        arr = self._fig_to_array(fig)
+        plt.close(fig)
+        return arr
+
+    def create_similarity_matrix_from_numpy(self, sim_matrix: np.ndarray, step: int) -> np.ndarray:
+        """Create similarity matrix from numpy array (internal use)."""
+        num_heads = sim_matrix.shape[0]
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+        im = ax.imshow(sim_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
+        ax.set_title(f'Head Similarity Matrix (Step {step})')
+        ax.set_xlabel('Head')
+        ax.set_ylabel('Head')
+        plt.colorbar(im, ax=ax, label='Cosine Similarity')
+        ax.set_xticks(range(num_heads))
+        ax.set_yticks(range(num_heads))
+        plt.tight_layout()
+
+        arr = self._fig_to_array(fig)
+        plt.close(fig)
+        return arr
+
+    def generate_frames_from_data(self):
+        """Convert stored raw data into visualization frames for GIF generation."""
+        # Generate attention frames
+        self._attention_frames = []
+        for step, attn_np in self.attention_data:
+            frame = self.create_attention_grid_from_numpy(attn_np, step, self._num_registers)
+            self._attention_frames.append((step, frame))
+
+        # Generate differential attention frames
+        self._diff_attn_frames = []
+        for step, data in self.diff_attn_data:
+            frame = self.create_diff_attention_grid(
+                data['attn1'], data['attn2'], step, self._num_registers
+            )
+            self._diff_attn_frames.append((step, frame))
+
+        # Generate entropy frames
+        self._entropy_frames = []
+        for step, entropy_np in self.entropy_data:
+            frame = self.create_entropy_chart_from_numpy(entropy_np, step)
+            self._entropy_frames.append((step, frame))
+
+        # Generate similarity frames
+        self._similarity_frames = []
+        for step, sim_np in self.similarity_data:
+            frame = self.create_similarity_matrix_from_numpy(sim_np, step)
+            self._similarity_frames.append((step, frame))
+
+        # Generate sample frames
+        self._sample_frames = []
+        for step, samples_np in self.sample_data:
+            frame = self.create_sample_grid(samples_np, step)
+            self._sample_frames.append((step, frame))
 
     def create_gif(
         self,
@@ -324,12 +553,13 @@ class AttentionVisualizer:
 
         return output_path
 
-    def generate_all_gifs(self, output_dir: str) -> Dict[str, str]:
+    def generate_all_gifs(self, output_dir: str, step_suffix: str = "") -> Dict[str, str]:
         """
-        Generate all GIFs from stored frames.
+        Generate all GIFs from stored data.
 
         Args:
             output_dir: Directory to save GIFs
+            step_suffix: Optional suffix for filenames (e.g., "_step_1000")
 
         Returns:
             Dict mapping GIF name to file path
@@ -337,26 +567,35 @@ class AttentionVisualizer:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # First convert stored data to frames
+        self.generate_frames_from_data()
+
         gifs = {}
+        suffix = step_suffix if step_suffix else ""
 
-        if self.attention_frames:
-            path = str(output_dir / 'attention_evolution.gif')
-            self.create_gif(self.attention_frames, path, fps=8)
-            gifs['attention_evolution'] = path
+        if self._attention_frames:
+            path = str(output_dir / f'attention_grid{suffix}.gif')
+            self.create_gif(self._attention_frames, path, fps=8)
+            gifs['attention_grid'] = path
 
-        if self.entropy_frames:
-            path = str(output_dir / 'entropy_evolution.gif')
-            self.create_gif(self.entropy_frames, path, fps=8)
+        if self._diff_attn_frames:
+            path = str(output_dir / f'diff_attention_grid{suffix}.gif')
+            self.create_gif(self._diff_attn_frames, path, fps=8)
+            gifs['diff_attention_grid'] = path
+
+        if self._entropy_frames:
+            path = str(output_dir / f'entropy_evolution{suffix}.gif')
+            self.create_gif(self._entropy_frames, path, fps=8)
             gifs['entropy_evolution'] = path
 
-        if self.similarity_frames:
-            path = str(output_dir / 'similarity_evolution.gif')
-            self.create_gif(self.similarity_frames, path, fps=8)
+        if self._similarity_frames:
+            path = str(output_dir / f'similarity_evolution{suffix}.gif')
+            self.create_gif(self._similarity_frames, path, fps=8)
             gifs['similarity_evolution'] = path
 
-        if self.sample_frames:
-            path = str(output_dir / 'samples_evolution.gif')
-            self.create_gif(self.sample_frames, path, fps=5)
+        if self._sample_frames:
+            path = str(output_dir / f'samples_evolution{suffix}.gif')
+            self.create_gif(self._sample_frames, path, fps=5)
             gifs['samples_evolution'] = path
 
         # Create metrics history plot as final frame
@@ -364,11 +603,23 @@ class AttentionVisualizer:
             last_step = max(h[-1][0] for h in self.metrics_history.values() if h)
             metrics_plot = self.create_metrics_plot(last_step)
             img = Image.fromarray(metrics_plot)
-            path = str(output_dir / 'metrics_final.png')
+            path = str(output_dir / f'metrics_history{suffix}.png')
             img.save(path)
-            gifs['metrics_final'] = path
+            gifs['metrics_history'] = path
 
         return gifs
+
+    def clear_data(self):
+        """Clear stored data after GIF generation to free memory."""
+        self.attention_data.clear()
+        self.diff_attn_data.clear()
+        self.entropy_data.clear()
+        self.similarity_data.clear()
+        # Keep sample_data and metrics_history for full training visualization
+        self._attention_frames.clear()
+        self._diff_attn_frames.clear()
+        self._entropy_frames.clear()
+        self._similarity_frames.clear()
 
     def upload_gifs_to_wandb(self, wandb_utils, gifs: Dict[str, str], step: int):
         """Upload generated GIFs to wandb."""
