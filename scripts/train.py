@@ -38,10 +38,68 @@ from pathlib import Path
 import torch.nn.functional as F
 from torchmetrics.image.fid import FrechetInceptionDistance
 import math
+from pokemon_eqm.utils.visualization import AttentionVisualizer, create_combined_dashboard
 
-def log_attention_maps(model, sample_input, sample_t, sample_y, step, wandb_utils, num_registers=0, use_diff_attn=False):
+def compute_attention_metrics_only(model, sample_input, sample_t, sample_y,
+                                    num_registers=0, use_diff_attn=False):
     """
-    Log attention maps from all heads to wandb.
+    Compute attention quality metrics (lightweight, no visualization).
+
+    Args:
+        model: EqM model
+        sample_input: Sample input tensor [B, C, H, W]
+        sample_t: Timestep tensor [B]
+        sample_y: Class label tensor [B]
+        num_registers: Number of register tokens
+        use_diff_attn: Whether using differential attention
+
+    Returns:
+        Dict of scalar metrics
+    """
+    from pokemon_eqm.utils.attention_metrics import compute_all_metrics, get_scalar_metrics
+
+    was_training = model.training
+    model.eval()
+
+    with torch.no_grad():
+        # Get attention from middle layer
+        _, attn_weights = model(sample_input, sample_t, sample_y,
+                                return_attention=True,
+                                attention_layer_idx=len(model.blocks)//2)
+
+        # Handle differential attention format
+        if use_diff_attn and isinstance(attn_weights, dict):
+            attn_for_metrics = attn_weights['attn1']  # [B, num_heads, N, N]
+        else:
+            if attn_weights.dim() == 3:
+                attn_for_metrics = attn_weights.unsqueeze(0)
+            else:
+                attn_for_metrics = attn_weights
+
+        N = attn_for_metrics.shape[-1]
+        num_patches_total = N - num_registers if num_registers > 0 else N
+        spatial_size = int(num_patches_total ** 0.5)
+
+        # Compute metrics
+        metrics = compute_all_metrics(
+            attn=attn_for_metrics,
+            spatial_size=spatial_size,
+            num_registers=num_registers,
+        )
+
+        scalar_metrics = get_scalar_metrics(metrics)
+
+    if was_training:
+        model.train()
+
+    return scalar_metrics
+
+
+def log_attention_maps(model, sample_input, sample_t, sample_y, step, wandb_utils,
+                       num_registers=0, use_diff_attn=False, compute_metrics=True,
+                       log_visualizations=True):
+    """
+    Log attention maps and quality metrics from all heads to wandb.
 
     Args:
         model: EqM model (in eval mode)
@@ -52,8 +110,12 @@ def log_attention_maps(model, sample_input, sample_t, sample_y, step, wandb_util
         wandb_utils: Wandb logging utility
         num_registers: Number of register tokens
         use_diff_attn: Whether using differential attention
+        compute_metrics: Whether to compute and log attention quality metrics
+        log_visualizations: Whether to log heatmap visualizations (expensive)
     """
     import wandb
+    import matplotlib.pyplot as plt
+    from pokemon_eqm.utils.attention_metrics import compute_all_metrics, get_scalar_metrics
 
     model.eval()
     with torch.no_grad():
@@ -65,53 +127,111 @@ def log_attention_maps(model, sample_input, sample_t, sample_y, step, wandb_util
             attn1 = attn_weights['attn1']  # [B, num_heads, N, N]
             attn2 = attn_weights['attn2']
             lambda_val = attn_weights['lambda']
-            # Effective attention: attn1 - lambda * attn2
-            attn = attn1[0]  # Just use first sample, first attention matrix
+            # For visualization, use first sample
+            attn = attn1[0]  # [num_heads, N, N]
             attn2_vis = attn2[0]
+            # For metrics, use full batch with attn1 (primary attention)
+            attn_for_metrics = attn1  # [B, num_heads, N, N]
         else:
             attn = attn_weights[0]  # [num_heads, N, N]
             attn2_vis = None
+            # For metrics, need to add batch dim if not present
+            if attn_weights.dim() == 3:
+                attn_for_metrics = attn_weights.unsqueeze(0)  # [1, num_heads, N, N]
+            else:
+                attn_for_metrics = attn_weights
 
         num_heads = attn.shape[0]
         N = attn.shape[1]
 
-        # Skip registers for visualization
-        if num_registers > 0:
-            attn = attn[:, num_registers:, num_registers:]
-            if attn2_vis is not None:
-                attn2_vis = attn2_vis[:, num_registers:, num_registers:]
+        # Compute spatial size before skipping registers
+        num_patches_total = N - num_registers if num_registers > 0 else N
+        spatial_size = int(num_patches_total ** 0.5)
 
-        num_patches = attn.shape[1]
-        H = W = int(num_patches ** 0.5)
-
-        # Visualize attention from center patch
-        center_idx = num_patches // 2
-
-        images = {}
-        for head_idx in range(num_heads):
-            # Attention from center to all patches
-            attn_from_center = attn[head_idx, center_idx].view(H, W)
-
-            # Normalize for visualization
-            attn_vis = attn_from_center - attn_from_center.min()
-            attn_vis = attn_vis / (attn_vis.max() + 1e-8)
-
-            images[f"attention/head_{head_idx:02d}"] = wandb.Image(
-                attn_vis.cpu().numpy(),
-                caption=f"Head {head_idx}"
+        # Compute attention quality metrics (before skipping registers for viz)
+        if compute_metrics:
+            metrics = compute_all_metrics(
+                attn=attn_for_metrics,
+                spatial_size=spatial_size,
+                num_registers=num_registers,
             )
 
-            # Also log attn2 for differential attention
-            if attn2_vis is not None:
-                attn2_from_center = attn2_vis[head_idx, center_idx].view(H, W)
-                attn2_norm = attn2_from_center - attn2_from_center.min()
-                attn2_norm = attn2_norm / (attn2_norm.max() + 1e-8)
-                images[f"attention_neg/head_{head_idx:02d}"] = wandb.Image(
-                    attn2_norm.cpu().numpy(),
-                    caption=f"Head {head_idx} (subtracted)"
+            # Log scalar metrics
+            scalar_metrics = get_scalar_metrics(metrics)
+            wandb_utils.log({f'attention/{k}': v for k, v in scalar_metrics.items()}, step=step)
+
+            # Log visualizations (only when requested - these are expensive)
+            if log_visualizations:
+                # Log head similarity matrix as heatmap
+                if 'diversity/similarity_matrix' in metrics:
+                    sim_matrix = metrics['diversity/similarity_matrix'].cpu().numpy()
+                    fig, ax = plt.subplots(figsize=(8, 8))
+                    im = ax.imshow(sim_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
+                    ax.set_title(f'Head Similarity Matrix (step {step})')
+                    ax.set_xlabel('Head')
+                    ax.set_ylabel('Head')
+                    plt.colorbar(im, ax=ax, label='Cosine Similarity')
+                    ax.set_xticks(range(num_heads))
+                    ax.set_yticks(range(num_heads))
+                    plt.tight_layout()
+                    wandb_utils.log({'attention/head_similarity_matrix': wandb.Image(fig)}, step=step)
+                    plt.close(fig)
+
+                # Log per-head entropy bar chart
+                if 'entropy/per_head' in metrics:
+                    per_head_ent = metrics['entropy/per_head'].cpu().numpy()
+                    fig, ax = plt.subplots(figsize=(12, 4))
+                    ax.bar(range(len(per_head_ent)), per_head_ent, color='steelblue', edgecolor='navy')
+                    ax.set_xlabel('Head Index')
+                    ax.set_ylabel('Entropy')
+                    ax.set_title(f'Per-Head Attention Entropy (step {step})')
+                    mean_ent = per_head_ent.mean()
+                    ax.axhline(y=mean_ent, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_ent:.3f}')
+                    ax.legend()
+                    ax.set_xticks(range(len(per_head_ent)))
+                    plt.tight_layout()
+                    wandb_utils.log({'attention/per_head_entropy_chart': wandb.Image(fig)}, step=step)
+                    plt.close(fig)
+
+        # Visualize attention heatmaps (only when requested)
+        if log_visualizations:
+            # Skip registers for visualization
+            if num_registers > 0:
+                attn = attn[:, num_registers:, num_registers:]
+                if attn2_vis is not None:
+                    attn2_vis = attn2_vis[:, num_registers:, num_registers:]
+
+            num_patches = attn.shape[1]
+            H = W = int(num_patches ** 0.5)
+
+            # Visualize attention from center patch
+            center_idx = num_patches // 2
+
+            images = {}
+            for head_idx in range(num_heads):
+                # Attention from center to all patches
+                attn_from_center = attn[head_idx, center_idx].view(H, W)
+
+                # Normalize for visualization
+                attn_vis = attn_from_center - attn_from_center.min()
+                attn_vis = attn_vis / (attn_vis.max() + 1e-8)
+
+                images[f"attention/head_{head_idx:02d}"] = wandb.Image(
+                    attn_vis.cpu().numpy(),
+                    caption=f"Head {head_idx}"
                 )
 
-        wandb_utils.log(images, step=step)
+                # Also log attn2 for differential attention
+                if attn2_vis is not None:
+                    attn2_from_center = attn2_vis[head_idx, center_idx].view(H, W)
+                    attn2_norm = attn2_from_center - attn2_from_center.min()
+                    attn2_norm = attn2_norm / (attn2_norm.max() + 1e-8)
+                    images[f"attention_neg/head_{head_idx:02d}"] = wandb.Image(
+                        attn2_norm.cpu().numpy(),
+                        caption=f"Head {head_idx} (subtracted)"
+                    )
+
+            wandb_utils.log(images, step=step)
 
     model.train()
 
@@ -315,7 +435,12 @@ def main(args):
     os.makedirs(checkpoint_dir, exist_ok=True)
     sample_dir = f"{experiment_dir}/samples"
     os.makedirs(sample_dir, exist_ok=True)
-    
+    viz_dir = f"{experiment_dir}/visualizations"
+    os.makedirs(viz_dir, exist_ok=True)
+
+    # Initialize attention visualizer for GIF generation
+    visualizer = AttentionVisualizer(save_dir=viz_dir, max_frames=500)
+
     logger = create_logger(experiment_dir)
     logger.info(f"Experiment directory created at {experiment_dir}")
 
@@ -582,6 +707,88 @@ def main(args):
                 if 'disp_loss' in loss_dict:
                     disp_val = loss_dict['disp_loss']
                     log_dict["train/disp_loss"] = disp_val.item() if torch.is_tensor(disp_val) else disp_val
+
+                # Compute attention metrics and store visualization frames every step
+                if getattr(args, 'compute_attention_metrics', True):
+                    sample_x_attn = x[:1]  # Use first sample from batch
+                    sample_t_attn = torch.rand(1, device=device)
+                    sample_y_attn = y[:1]
+
+                    # Get attention weights with full metrics
+                    from pokemon_eqm.utils.attention_metrics import compute_all_metrics, get_scalar_metrics
+
+                    was_training = model.training
+                    model.eval()
+                    with torch.no_grad():
+                        _, attn_weights = model(
+                            sample_x_attn, sample_t_attn, sample_y_attn,
+                            return_attention=True,
+                            attention_layer_idx=len(model.blocks)//2
+                        )
+
+                        # Handle differential attention format
+                        use_diff_attn = getattr(args, 'use_diff_attn', False)
+                        num_registers = getattr(args, 'num_registers', 0)
+
+                        if use_diff_attn and isinstance(attn_weights, dict):
+                            attn_for_metrics = attn_weights['attn1']
+                            attn_for_viz = attn_weights['attn1'][0]  # First sample
+                        else:
+                            if attn_weights.dim() == 3:
+                                attn_for_metrics = attn_weights.unsqueeze(0)
+                            else:
+                                attn_for_metrics = attn_weights
+                            attn_for_viz = attn_weights[0] if attn_weights.dim() == 4 else attn_weights
+
+                        N = attn_for_metrics.shape[-1]
+                        num_patches_total = N - num_registers if num_registers > 0 else N
+                        spatial_size = int(num_patches_total ** 0.5)
+
+                        # Compute all metrics
+                        metrics = compute_all_metrics(
+                            attn=attn_for_metrics,
+                            spatial_size=spatial_size,
+                            num_registers=num_registers,
+                        )
+
+                        # Add scalar metrics to log dict
+                        scalar_metrics = get_scalar_metrics(metrics)
+                        for k, v in scalar_metrics.items():
+                            log_dict[f'attention/{k}'] = v
+
+                        # Store metrics history in visualizer
+                        visualizer.add_metrics(train_steps, scalar_metrics)
+
+                        # Store visualization frames (for GIF generation)
+                        visualizer.add_attention_frame(attn_for_viz, train_steps, num_registers)
+                        if 'entropy/per_head' in metrics:
+                            visualizer.add_entropy_frame(metrics['entropy/per_head'], train_steps)
+                        if 'diversity/similarity_matrix' in metrics:
+                            visualizer.add_similarity_frame(metrics['diversity/similarity_matrix'], train_steps)
+
+                        # Log all visualizations to wandb every step
+                        import wandb
+                        import matplotlib
+                        matplotlib.use('Agg')  # Non-interactive backend
+                        import matplotlib.pyplot as plt
+
+                        # Attention grid visualization
+                        attn_grid = visualizer.create_attention_grid(attn_for_viz, train_steps, num_registers)
+                        log_dict['attention/grid'] = wandb.Image(attn_grid, caption=f'Attention Step {train_steps}')
+
+                        # Entropy chart
+                        if 'entropy/per_head' in metrics:
+                            entropy_chart = visualizer.create_entropy_chart(metrics['entropy/per_head'], train_steps)
+                            log_dict['attention/entropy_chart'] = wandb.Image(entropy_chart, caption=f'Entropy Step {train_steps}')
+
+                        # Similarity matrix
+                        if 'diversity/similarity_matrix' in metrics:
+                            sim_img = visualizer.create_similarity_matrix(metrics['diversity/similarity_matrix'], train_steps)
+                            log_dict['attention/similarity_matrix'] = wandb.Image(sim_img, caption=f'Similarity Step {train_steps}')
+
+                    if was_training:
+                        model.train()
+
                 wandb_utils.log(log_dict, step=train_steps)
 
             if train_steps % args.log_every == 0:
@@ -603,20 +810,23 @@ def main(args):
                 log_steps = 0
                 start_time = time()
 
-            # Log attention maps periodically
+            # Log attention visualizations periodically (metrics are logged every step above)
             log_attention_every = getattr(args, 'log_attention_every', 0)
             if args.wandb and log_attention_every > 0 and train_steps % log_attention_every == 0 and train_steps > 0:
-                logger.info(f"Logging attention maps at step {train_steps}...")
+                logger.info(f"Logging attention visualizations at step {train_steps}...")
                 # Use a sample from current batch for attention visualization
                 with torch.no_grad():
                     sample_x = x[:1].to(device)  # Just first sample
                     sample_t_attn = torch.rand(1, device=device)
                     sample_y_attn = y[:1].to(device)
+                    # compute_metrics=True to get matrices for visualization, log_visualizations=True for heatmaps
                     log_attention_maps(
                         model, sample_x, sample_t_attn, sample_y_attn,
                         train_steps, wandb_utils,
                         num_registers=getattr(args, 'num_registers', 0),
-                        use_diff_attn=getattr(args, 'use_diff_attn', False)
+                        use_diff_attn=getattr(args, 'use_diff_attn', False),
+                        compute_metrics=True,
+                        log_visualizations=True
                     )
 
             # Save EqM checkpoint:
@@ -739,7 +949,11 @@ def main(args):
                     return imgs
 
                 # Fixed noise (Visuals - default sampler)
-                generate_and_log(fixed_noise, "fixed", "gd", 250)
+                fixed_samples = generate_and_log(fixed_noise, "fixed", "gd", 250)
+
+                # Store samples for GIF generation
+                if fixed_samples is not None:
+                    visualizer.add_sample_frame(fixed_samples, train_steps)
                 
                 # FID Sampler Configurations
                 fid_configs = [
@@ -840,6 +1054,18 @@ def main(args):
                 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
+
+    # Generate and upload GIFs at end of training
+    logger.info("Generating attention visualization GIFs...")
+    try:
+        gifs = visualizer.generate_all_gifs(viz_dir)
+        if gifs:
+            logger.info(f"Generated {len(gifs)} GIFs: {list(gifs.keys())}")
+            if args.wandb:
+                visualizer.upload_gifs_to_wandb(wandb_utils, gifs, train_steps)
+                logger.info("Uploaded GIFs to wandb")
+    except Exception as e:
+        logger.warning(f"Failed to generate GIFs: {e}")
 
     logger.info("Done!")
 
