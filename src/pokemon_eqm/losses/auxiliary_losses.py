@@ -49,6 +49,9 @@ class AuxiliaryLossComputer(nn.Module):
         # Hard focus (anti-curriculum attention)
         hard_focus_weight: float = 0.02,
         complexity_diversity_weight: float = 0.01,
+        # Head specialization (2024-2025 research: MoH, attention orthogonality)
+        complexity_ortho_weight: float = 0.01,
+        load_balance_weight: float = 0.005,
         # Warmup
         warmup_steps: int = 1000,
     ):
@@ -78,6 +81,10 @@ class AuxiliaryLossComputer(nn.Module):
         # Hard focus parameters
         self.hard_focus_weight = hard_focus_weight
         self.complexity_diversity_weight = complexity_diversity_weight
+
+        # Head specialization parameters
+        self.complexity_ortho_weight = complexity_ortho_weight
+        self.load_balance_weight = load_balance_weight
 
         # Warmup
         self.warmup_steps = warmup_steps
@@ -365,6 +372,142 @@ class AuxiliaryLossComputer(nn.Module):
 
         return self.complexity_diversity_weight * variance_deficit.mean()
 
+    def head_aware_hard_focus_loss(
+        self,
+        attn_weights: torch.Tensor,
+        patch_complexity: torch.Tensor,
+        head_routing: torch.Tensor,
+        num_registers: int = 0,
+    ) -> torch.Tensor:
+        """
+        Per-head hard focus loss respecting head specialization.
+
+        Based on MoH (Mixture-of-Heads, 2024) and attention specialization research.
+        Only penalizes heads with positive routing (complex-focused) for attending
+        to easy patches. Context heads (negative routing) are not penalized.
+
+        Uses soft weighting via sigmoid so gradient flows smoothly through routing.
+
+        Args:
+            attn_weights: Post-softmax attention [B, H, N_q, N_k]
+            patch_complexity: Per-patch complexity scores [B, N] in [0, 1]
+            head_routing: Per-head routing values [H] (learnable)
+                +values -> focus on complex, -values -> focus on simple
+            num_registers: Number of register tokens
+
+        Returns:
+            Scalar loss (lower when complex-focused heads focus on hard patches)
+        """
+        B, H, N_q, N_k = attn_weights.shape
+
+        # Handle register tokens in complexity
+        if patch_complexity.shape[1] != N_k:
+            if num_registers > 0 and patch_complexity.shape[1] == N_k - num_registers:
+                reg_complexity = torch.ones(B, num_registers, device=patch_complexity.device, dtype=patch_complexity.dtype)
+                patch_complexity = torch.cat([reg_complexity, patch_complexity], dim=1)
+
+        # Soft weighting: heads with higher routing get penalized more
+        # sigmoid(routing * 2) maps: -inf->0, 0->0.5, +inf->1
+        routing_weight = torch.sigmoid(head_routing * 2)  # [H] in (0, 1)
+
+        # Easiness per key position
+        easiness = 1.0 - patch_complexity  # [B, N_k]
+
+        # Attention to easy patches per head: [B, H, N_q]
+        easy_attn = (attn_weights * easiness.view(B, 1, 1, N_k)).sum(dim=-1)
+
+        # Weight by routing (complex-focused heads penalized more)
+        weighted = easy_attn * routing_weight.view(1, H, 1)
+
+        # Skip register queries
+        if num_registers > 0:
+            weighted = weighted[:, :, num_registers:]
+
+        return self.hard_focus_weight * weighted.mean()
+
+    def complexity_ortho_loss(
+        self,
+        attn_weights: torch.Tensor,
+        patch_complexity: torch.Tensor,
+        num_registers: int = 0,
+    ) -> torch.Tensor:
+        """
+        Complexity-targeted orthogonal loss: force heads to have diverse complexity preferences.
+
+        Based on orthogonal head regularization research (2024-2025). Instead of making
+        heads orthogonal in general attention patterns, we specifically force them to
+        attend to different complexity levels.
+
+        This naturally spreads heads across all complexity levels, with some focusing
+        on high-complexity regions and others on low-complexity context.
+
+        Args:
+            attn_weights: Post-softmax attention [B, H, N_q, N_k]
+            patch_complexity: Per-patch complexity scores [B, N_k] in [0, 1]
+            num_registers: Number of register tokens
+
+        Returns:
+            Scalar loss (lower when heads have orthogonal complexity preferences)
+        """
+        B, H, N_q, N_k = attn_weights.shape
+
+        # Handle register tokens
+        if patch_complexity.shape[1] != N_k:
+            if num_registers > 0 and patch_complexity.shape[1] == N_k - num_registers:
+                reg_complexity = torch.ones(B, num_registers, device=patch_complexity.device, dtype=patch_complexity.dtype)
+                patch_complexity = torch.cat([reg_complexity, patch_complexity], dim=1)
+
+        # Per-head complexity preference: what complexity each head attends to
+        # attn_weights: [B, H, N_q, N_k], complexity: [B, N_k]
+        complexity_exp = patch_complexity.view(B, 1, 1, N_k)
+        # Weighted average complexity per head per query: [B, H, N_q]
+        complexity_per_query = (attn_weights * complexity_exp).sum(dim=-1)
+        # Average across queries and batch: [H]
+        complexity_pref = complexity_per_query.mean(dim=(0, 2))
+
+        # Normalize to unit vector for orthogonality computation
+        C = F.normalize(complexity_pref.unsqueeze(1), dim=0)  # [H, 1]
+
+        # Gram matrix: measures pairwise similarity
+        gram = C @ C.T  # [H, H]
+
+        # Target: identity (orthogonal preferences means off-diagonal should be 0)
+        # But for a 1D preference, perfect orthogonality isn't achievable
+        # Instead, we minimize off-diagonal similarity
+        identity = torch.eye(H, device=gram.device)
+        off_diag = gram - identity
+
+        return self.complexity_ortho_weight * (off_diag ** 2).mean()
+
+    def load_balance_loss(self, head_outputs: torch.Tensor) -> torch.Tensor:
+        """
+        Load balancing loss: ensure all heads contribute to output.
+
+        Inspired by Mixture-of-Experts load balancing (MoE, 2024). Prevents some
+        heads from dominating while others are underutilized. This is especially
+        important with head routing, as we want all specialized heads to contribute.
+
+        Args:
+            head_outputs: Per-head outputs [B, H, N, d]
+
+        Returns:
+            Scalar loss (lower when all heads contribute equally)
+        """
+        B, H, N, d = head_outputs.shape
+
+        # Compute per-head contribution (Frobenius norm)
+        head_norms = head_outputs.norm(dim=(-2, -1))  # [B, H]
+
+        # Normalize to get fraction of total output per head
+        total_norm = head_norms.sum(dim=-1, keepdim=True) + 1e-7
+        head_fractions = head_norms / total_norm  # [B, H]
+
+        # Target: uniform distribution 1/H
+        target = 1.0 / H
+
+        # Penalize deviation from uniform
+        return self.load_balance_weight * ((head_fractions - target) ** 2).mean()
+
     def forward(
         self,
         train_step: int,
@@ -375,6 +518,7 @@ class AuxiliaryLossComputer(nn.Module):
         entropy_normalized: Optional[torch.Tensor] = None,  # scalar or [H]
         patch_complexity: Optional[torch.Tensor] = None,  # [B, N] complexity scores
         num_registers: int = 0,  # Number of register tokens
+        head_routing: Optional[torch.Tensor] = None,  # [H] per-head routing for specialization
     ) -> Dict[str, torch.Tensor]:
         """
         Compute all auxiliary losses.
@@ -388,12 +532,14 @@ class AuxiliaryLossComputer(nn.Module):
             entropy_normalized: Pre-computed normalized entropy
             patch_complexity: Per-patch complexity scores for hard focus loss
             num_registers: Number of register tokens
+            head_routing: Per-head routing values for head specialization [H]
+                +values -> focus on complex, -values -> focus on simple
 
         Returns:
             Dict with individual loss components and 'total' sum.
             Keys: entropy_floor, entropy_ceiling, gate_entropy, gate_sparsity,
                   hsic, position_disagreement, lambda_smoothness, lambda_entropy,
-                  hard_focus, complexity_diversity, total
+                  hard_focus, complexity_diversity, complexity_ortho, load_balance, total
         """
         losses = {}
 
@@ -448,9 +594,24 @@ class AuxiliaryLossComputer(nn.Module):
 
         # 6. Hard focus losses (anti-curriculum attention)
         if patch_complexity is not None and attn_weights is not None:
-            losses['hard_focus'] = self.hard_focus_loss(attn_weights, patch_complexity, num_registers)
+            # Use head-aware loss if head_routing available, otherwise fall back to global
+            if head_routing is not None:
+                losses['hard_focus'] = self.head_aware_hard_focus_loss(
+                    attn_weights, patch_complexity, head_routing, num_registers
+                )
+            else:
+                losses['hard_focus'] = self.hard_focus_loss(attn_weights, patch_complexity, num_registers)
             losses['complexity_diversity'] = self.complexity_diversity_loss(attn_weights, patch_complexity, num_registers)
             total = total + warmup_scale * (losses['hard_focus'] + losses['complexity_diversity'])
+
+            # 7. Complexity-targeted orthogonal loss (head specialization)
+            losses['complexity_ortho'] = self.complexity_ortho_loss(attn_weights, patch_complexity, num_registers)
+            total = total + warmup_scale * losses['complexity_ortho']
+
+        # 8. Load balancing loss (ensure all heads contribute)
+        if head_outputs is not None:
+            losses['load_balance'] = self.load_balance_loss(head_outputs)
+            total = total + warmup_scale * losses['load_balance']
 
         losses['total'] = total
         return losses

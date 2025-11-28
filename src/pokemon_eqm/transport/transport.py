@@ -55,6 +55,8 @@ class Transport:
         loss_type,
         train_eps,
         sample_eps,
+        # Model architecture info (for aux losses)
+        num_registers=0,
         # SIGReg parameters
         use_sigreg=False,
         sigreg_lambda=0.05,
@@ -72,6 +74,11 @@ class Transport:
         aux_lambda_smoothness_weight=0.001,
         aux_lambda_entropy_weight=0.01,
         aux_warmup_steps=1000,
+        # Head specialization losses (2024-2025 research)
+        aux_hard_focus_weight=0.02,
+        aux_complexity_diversity_weight=0.01,
+        aux_complexity_ortho_weight=0.01,
+        aux_load_balance_weight=0.005,
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -84,6 +91,7 @@ class Transport:
         self.path_sampler = path_options[path_type]()
         self.train_eps = train_eps
         self.sample_eps = sample_eps
+        self.num_registers = num_registers
 
         # SIGReg initialization
         self.use_sigreg = use_sigreg and LEJEPA_AVAILABLE
@@ -112,9 +120,15 @@ class Transport:
                 lambda_smoothness_weight=aux_lambda_smoothness_weight,
                 lambda_entropy_weight=aux_lambda_entropy_weight,
                 warmup_steps=aux_warmup_steps,
+                # Head specialization losses
+                hard_focus_weight=aux_hard_focus_weight,
+                complexity_diversity_weight=aux_complexity_diversity_weight,
+                complexity_ortho_weight=aux_complexity_ortho_weight,
+                load_balance_weight=aux_load_balance_weight,
             )
             logging.info(f"Auxiliary losses initialized (entropy: {aux_entropy_floor_weight}/{aux_entropy_ceiling_weight}, "
-                        f"gate: {aux_gate_entropy_weight}/{aux_gate_sparsity_weight}, hsic: {aux_hsic_weight})")
+                        f"gate: {aux_gate_entropy_weight}/{aux_gate_sparsity_weight}, hsic: {aux_hsic_weight}, "
+                        f"hard_focus: {aux_hard_focus_weight}, complexity_ortho: {aux_complexity_ortho_weight})")
 
     def prior_logp(self, z):
         '''
@@ -284,12 +298,19 @@ class Transport:
             lambda_matrix = None
             entropy_normalized = None
 
+            # Additional variables for head specialization
+            patch_complexity = None
+            head_routing = None
+
             if isinstance(aux_info, dict):
                 # For DifferentialAttention: aux_info has 'attn1', 'attn2', 'head_outputs', 'gate_values', 'lambda_matrix'
                 attn_weights = aux_info.get('attn1', aux_info.get('attn', None))
                 head_outputs = aux_info.get('head_outputs', None)
                 gate_values = aux_info.get('gate_values', None)
                 lambda_matrix = aux_info.get('lambda_matrix', None)
+                # Head specialization: complexity and routing (2024-2025 research)
+                patch_complexity = aux_info.get('patch_complexity', None)
+                head_routing = aux_info.get('head_routing', None)
 
                 # Compute entropy from attention weights if available
                 if attn_weights is not None:
@@ -300,7 +321,7 @@ class Transport:
                     max_entropy = th.log(th.tensor(attn_weights.shape[-1], dtype=attn_weights.dtype, device=attn_weights.device))
                     entropy_normalized = (entropy_per_head / max_entropy).mean()
 
-            # Compute all aux losses
+            # Compute all aux losses (including head specialization)
             aux_loss_dict = self.aux_loss_computer(
                 train_step=train_step,
                 attn_weights=attn_weights,
@@ -308,6 +329,9 @@ class Transport:
                 gate_values=gate_values,
                 lambda_matrix=lambda_matrix,
                 entropy_normalized=entropy_normalized,
+                patch_complexity=patch_complexity,
+                num_registers=self.num_registers,
+                head_routing=head_routing,
             )
             aux_loss_total = aux_loss_dict.get('total', 0)
 

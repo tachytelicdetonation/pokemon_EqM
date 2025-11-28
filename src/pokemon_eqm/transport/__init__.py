@@ -6,6 +6,8 @@ def create_transport(
     loss_weight=None,
     train_eps=None,
     sample_eps=None,
+    # Model architecture info (for aux losses)
+    num_registers=0,
     # SIGReg parameters
     use_sigreg=False,
     sigreg_lambda=0.05,
@@ -23,6 +25,11 @@ def create_transport(
     aux_lambda_smoothness_weight=0.001,
     aux_lambda_entropy_weight=0.01,
     aux_warmup_steps=1000,
+    # Head specialization losses (2024-2025 research: MoH, orthogonality)
+    aux_hard_focus_weight=0.02,
+    aux_complexity_diversity_weight=0.01,
+    aux_complexity_ortho_weight=0.01,
+    aux_load_balance_weight=0.005,
 ):
     """function for creating Transport object
     **Note**: model prediction defaults to velocity
@@ -49,6 +56,11 @@ def create_transport(
     - aux_lambda_smoothness_weight: weight for M-DGSA lambda smoothness
     - aux_lambda_entropy_weight: weight for M-DGSA lambda entropy
     - aux_warmup_steps: warmup steps for auxiliary losses
+    - num_registers: number of register tokens (for aux loss computation)
+    - aux_hard_focus_weight: weight for hard focus loss (anti-curriculum attention)
+    - aux_complexity_diversity_weight: weight for complexity diversity loss
+    - aux_complexity_ortho_weight: weight for complexity orthogonal loss
+    - aux_load_balance_weight: weight for head load balancing loss
     """
 
     if prediction == "noise":
@@ -90,6 +102,7 @@ def create_transport(
         loss_type=loss_type,
         train_eps=train_eps,
         sample_eps=sample_eps,
+        num_registers=num_registers,
         use_sigreg=use_sigreg,
         sigreg_lambda=sigreg_lambda,
         sigreg_num_slices=sigreg_num_slices,
@@ -106,6 +119,11 @@ def create_transport(
         aux_lambda_smoothness_weight=aux_lambda_smoothness_weight,
         aux_lambda_entropy_weight=aux_lambda_entropy_weight,
         aux_warmup_steps=aux_warmup_steps,
+        # Head specialization losses
+        aux_hard_focus_weight=aux_hard_focus_weight,
+        aux_complexity_diversity_weight=aux_complexity_diversity_weight,
+        aux_complexity_ortho_weight=aux_complexity_ortho_weight,
+        aux_load_balance_weight=aux_load_balance_weight,
     )
 
     return state

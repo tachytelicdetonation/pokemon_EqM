@@ -990,6 +990,8 @@ class Attention(nn.Module):
         use_complexity_bias=False,  # Bias attention toward high-complexity patches
         complexity_method='variance',  # 'variance', 'gradient', 'entropy', 'combined'
         complexity_bias_scale=1.0,  # Scale for complexity bias strength
+        # Head routing for complexity specialization (MoH 2024, attention orthogonality)
+        use_head_routing=False,  # Enable learnable per-head complexity routing
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -997,6 +999,7 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = head_dim ** -0.5
         self.use_liere = use_liere
+        self.use_head_routing = use_head_routing
         self.spatial_dims = spatial_dims
         self.num_registers = num_registers
         self.use_spatial_decay = use_spatial_decay
@@ -1047,6 +1050,14 @@ class Attention(nn.Module):
                 pos_embed_jitter=liere_pos_embed_jitter,
                 pos_embed_rescale=liere_pos_embed_rescale
             )
+
+        # Learnable per-head complexity routing (MoH 2024)
+        # Initialized to 0 (neutral); training optimizes:
+        # +values -> focus on complex regions, -values -> focus on simple regions
+        if use_head_routing:
+            self.head_routing = nn.Parameter(torch.zeros(num_heads))
+        else:
+            self.register_buffer('head_routing', None)
 
     def forward(self, x, return_attention=False, return_aux_info=False):
         B, N, C = x.shape
@@ -1163,6 +1174,7 @@ class Attention(nn.Module):
                     'head_outputs': head_outputs,
                     'gate_values': gate_values,
                     'patch_complexity': patch_complexity,
+                    'head_routing': self.head_routing,  # For head specialization loss
                 }
             return x, result
         return x
@@ -1244,6 +1256,8 @@ class DifferentialAttention(nn.Module):
         use_complexity_bias=False,  # Bias attention toward high-complexity patches
         complexity_method='variance',  # 'variance', 'gradient', 'entropy', 'combined'
         complexity_bias_scale=1.0,  # Scale for complexity bias strength
+        # Head routing for complexity specialization (MoH 2024, attention orthogonality)
+        use_head_routing=False,  # Enable learnable per-head complexity routing
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -1252,6 +1266,7 @@ class DifferentialAttention(nn.Module):
         self.head_dim = dim // num_heads // 2
         self.scale = self.head_dim ** -0.5
         self.use_liere = use_liere
+        self.use_head_routing = use_head_routing
         self.spatial_dims = spatial_dims
         self.num_registers = num_registers
         self.layer_idx = layer_idx
@@ -1330,6 +1345,14 @@ class DifferentialAttention(nn.Module):
                 gate_init_bias=output_gate_init_bias,
                 gate_type=output_gate_type
             )
+
+        # Learnable per-head complexity routing (MoH 2024)
+        # Initialized to 0 (neutral); training optimizes:
+        # +values -> focus on complex regions, -values -> focus on simple regions
+        if use_head_routing:
+            self.head_routing = nn.Parameter(torch.zeros(num_heads))
+        else:
+            self.register_buffer('head_routing', None)
 
     def forward(self, x, return_attention=False, return_aux_info=False):
         B, N, C = x.shape
@@ -1509,6 +1532,7 @@ class DifferentialAttention(nn.Module):
                 result['gate_values'] = gate_values
                 result['lambda_matrix'] = lambda_for_return if self.use_matrix_lambda else None
                 result['patch_complexity'] = patch_complexity
+                result['head_routing'] = self.head_routing  # For head specialization loss
             return out, result
         return out
 
@@ -1629,6 +1653,8 @@ class EqM(nn.Module):
         use_complexity_bias=False,
         complexity_method='variance',
         complexity_bias_scale=1.0,
+        # Head routing for complexity specialization (MoH 2024, attention orthogonality)
+        use_head_routing=False,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -1681,6 +1707,7 @@ class EqM(nn.Module):
             use_complexity_bias=use_complexity_bias,
             complexity_method=complexity_method,
             complexity_bias_scale=complexity_bias_scale,
+            use_head_routing=use_head_routing,
         )
 
         # Create blocks with layer indices for differential attention lambda initialization

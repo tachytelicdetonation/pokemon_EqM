@@ -389,6 +389,23 @@ def main(args):
         use_content_gate=getattr(
             args, "use_content_gate", True
         ),  # Content-aware gating (SDT-style)
+        # M-DGSA parameters
+        use_matrix_lambda=getattr(args, "use_matrix_lambda", False),
+        matrix_lambda_scale=getattr(args, "matrix_lambda_scale", 1.0),
+        matrix_lambda_use_qk=getattr(args, "matrix_lambda_use_qk", True),
+        # G1 output gating for attention sink elimination
+        use_output_gate=getattr(args, "use_output_gate", False),
+        output_gate_type=getattr(args, "output_gate_type", "per_token"),
+        output_gate_init_bias=getattr(args, "output_gate_init_bias", -2.0),
+        # σReparam for entropy collapse prevention
+        use_sigma_reparam=getattr(args, "use_sigma_reparam", False),
+        sigma_target=getattr(args, "sigma_target", 1.0),
+        # Complexity bias for anti-curriculum attention
+        use_complexity_bias=getattr(args, "use_complexity_bias", False),
+        complexity_method=getattr(args, "complexity_method", "variance"),
+        complexity_bias_scale=getattr(args, "complexity_bias_scale", 1.0),
+        # Head routing for complexity specialization
+        use_head_routing=getattr(args, "use_head_routing", False),
     ).to(device)
 
     # Note that parameter initialization is done within the EqM constructor
@@ -440,6 +457,8 @@ def main(args):
         args.loss_weight,
         args.train_eps,
         args.sample_eps,
+        # Model architecture info
+        num_registers=getattr(args, "num_registers", 0),
         # SIGReg parameters
         use_sigreg=getattr(args, "use_sigreg", False),
         sigreg_lambda=getattr(args, "sigreg_lambda", 0.05),
@@ -463,6 +482,11 @@ def main(args):
         ),
         aux_lambda_entropy_weight=getattr(args, "aux_lambda_entropy_weight", 0.01),
         aux_warmup_steps=getattr(args, "aux_warmup_steps", 1000),
+        # Head specialization losses (2024-2025 research)
+        aux_hard_focus_weight=getattr(args, "aux_hard_focus_weight", 0.02),
+        aux_complexity_diversity_weight=getattr(args, "aux_complexity_diversity_weight", 0.01),
+        aux_complexity_ortho_weight=getattr(args, "aux_complexity_ortho_weight", 0.01),
+        aux_load_balance_weight=getattr(args, "aux_load_balance_weight", 0.005),
     )  # default: velocity;
     transport_sampler = Sampler(transport)
 
