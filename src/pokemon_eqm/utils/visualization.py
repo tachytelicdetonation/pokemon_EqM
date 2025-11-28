@@ -2,6 +2,8 @@
 
 import torch
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for thread safety
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from pathlib import Path
@@ -9,6 +11,168 @@ from typing import Dict, List, Optional, Tuple, Union
 import io
 from PIL import Image
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+
+
+def _render_attention_grid(args):
+    """Worker function for parallel attention grid rendering."""
+    step, attn_np, num_registers = args
+
+    if num_registers > 0:
+        attn_np = attn_np[:, num_registers:, num_registers:]
+
+    num_heads = attn_np.shape[0]
+    num_patches = attn_np.shape[1]
+    H = W = int(num_patches ** 0.5)
+    center_idx = num_patches // 2
+
+    cols = min(4, num_heads)
+    rows = (num_heads + cols - 1) // cols
+
+    fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows))
+    if rows == 1 and cols == 1:
+        axes = np.array([[axes]])
+    elif rows == 1:
+        axes = axes.reshape(1, -1)
+    elif cols == 1:
+        axes = axes.reshape(-1, 1)
+
+    fig.suptitle(f'Attention from Center (Step {step})', fontsize=14)
+
+    for head_idx in range(num_heads):
+        row, col = head_idx // cols, head_idx % cols
+        ax = axes[row, col]
+        attn_from_center = attn_np[head_idx, center_idx].reshape(H, W)
+        attn_vis = attn_from_center - attn_from_center.min()
+        attn_vis = attn_vis / (attn_vis.max() + 1e-8)
+        ax.imshow(attn_vis, cmap='viridis', vmin=0, vmax=1)
+        ax.set_title(f'Head {head_idx}', fontsize=10)
+        ax.axis('off')
+
+    for idx in range(num_heads, rows * cols):
+        row, col = idx // cols, idx % cols
+        axes[row, col].axis('off')
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    arr = np.array(Image.open(buf))
+    buf.close()
+    plt.close(fig)
+    return step, arr
+
+
+def _render_diff_attention_grid(args):
+    """Worker function for parallel differential attention grid rendering."""
+    step, attn1, attn2, num_registers = args
+
+    if num_registers > 0:
+        attn1 = attn1[:, num_registers:, num_registers:]
+        attn2 = attn2[:, num_registers:, num_registers:]
+
+    num_heads = attn1.shape[0]
+    num_patches = attn1.shape[1]
+    H = W = int(num_patches ** 0.5)
+    center_idx = num_patches // 2
+
+    cols = min(4, num_heads)
+    rows = (num_heads + cols - 1) // cols
+
+    fig, axes = plt.subplots(rows * 2, cols, figsize=(3 * cols, 3 * rows * 2))
+    if rows * 2 == 1 and cols == 1:
+        axes = np.array([[axes]])
+    elif rows * 2 == 1:
+        axes = axes.reshape(1, -1)
+    elif cols == 1:
+        axes = axes.reshape(-1, 1)
+
+    fig.suptitle(f'Differential Attention (Step {step})\nTop: Primary (A1), Bottom: Subtracted (A2)', fontsize=12)
+
+    for head_idx in range(num_heads):
+        row_base = (head_idx // cols) * 2
+        col = head_idx % cols
+
+        ax1 = axes[row_base, col]
+        attn1_from_center = attn1[head_idx, center_idx].reshape(H, W)
+        attn1_vis = attn1_from_center - attn1_from_center.min()
+        attn1_vis = attn1_vis / (attn1_vis.max() + 1e-8)
+        ax1.imshow(attn1_vis, cmap='viridis', vmin=0, vmax=1)
+        ax1.set_title(f'H{head_idx} A1', fontsize=9)
+        ax1.axis('off')
+
+        ax2 = axes[row_base + 1, col]
+        attn2_from_center = attn2[head_idx, center_idx].reshape(H, W)
+        attn2_vis = attn2_from_center - attn2_from_center.min()
+        attn2_vis = attn2_vis / (attn2_vis.max() + 1e-8)
+        ax2.imshow(attn2_vis, cmap='magma', vmin=0, vmax=1)
+        ax2.set_title(f'H{head_idx} A2', fontsize=9)
+        ax2.axis('off')
+
+    for idx in range(num_heads, rows * cols):
+        row_base = (idx // cols) * 2
+        col = idx % cols
+        if row_base < axes.shape[0] and col < axes.shape[1]:
+            axes[row_base, col].axis('off')
+            axes[row_base + 1, col].axis('off')
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    arr = np.array(Image.open(buf))
+    buf.close()
+    plt.close(fig)
+    return step, arr
+
+
+def _render_entropy_chart(args):
+    """Worker function for parallel entropy chart rendering."""
+    step, per_head_entropy = args
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.bar(range(len(per_head_entropy)), per_head_entropy, color='steelblue', edgecolor='navy')
+    ax.set_xlabel('Head Index')
+    ax.set_ylabel('Entropy')
+    ax.set_title(f'Per-Head Attention Entropy (Step {step})')
+    mean_ent = per_head_entropy.mean()
+    ax.axhline(y=mean_ent, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_ent:.3f}')
+    ax.legend()
+    ax.set_xticks(range(len(per_head_entropy)))
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    arr = np.array(Image.open(buf))
+    buf.close()
+    plt.close(fig)
+    return step, arr
+
+
+def _render_similarity_matrix(args):
+    """Worker function for parallel similarity matrix rendering."""
+    step, sim_matrix = args
+    num_heads = sim_matrix.shape[0]
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    im = ax.imshow(sim_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
+    ax.set_title(f'Head Similarity Matrix (Step {step})')
+    ax.set_xlabel('Head')
+    ax.set_ylabel('Head')
+    plt.colorbar(im, ax=ax, label='Cosine Similarity')
+    ax.set_xticks(range(num_heads))
+    ax.set_yticks(range(num_heads))
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+    buf.seek(0)
+    arr = np.array(Image.open(buf))
+    buf.close()
+    plt.close(fig)
+    return step, arr
 
 
 class AttentionVisualizer:
@@ -479,47 +643,79 @@ class AttentionVisualizer:
         plt.close(fig)
         return arr
 
-    def generate_frames_from_data(self):
-        """Convert stored raw data into visualization frames for GIF generation."""
+    def generate_frames_from_data(self, max_workers: int = None):
+        """Convert stored raw data into visualization frames for GIF generation.
+
+        Args:
+            max_workers: Number of parallel workers (default: CPU count)
+        """
         total_frames = (len(self.attention_data) + len(self.diff_attn_data) +
                        len(self.entropy_data) + len(self.similarity_data) + len(self.sample_data))
 
         if total_frames == 0:
             return
 
+        if max_workers is None:
+            max_workers = min(os.cpu_count() or 4, 8)  # Cap at 8 workers
+
         pbar = tqdm(total=total_frames, desc="Generating GIF frames", leave=False)
 
-        # Generate attention frames
-        self._attention_frames = []
-        for step, attn_np in self.attention_data:
-            frame = self.create_attention_grid_from_numpy(attn_np, step, self._num_registers)
-            self._attention_frames.append((step, frame))
-            pbar.update(1)
+        # Use ThreadPoolExecutor for parallel rendering
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit attention frame tasks
+            attn_futures = []
+            for step, attn_np in self.attention_data:
+                future = executor.submit(_render_attention_grid, (step, attn_np, self._num_registers))
+                attn_futures.append(future)
 
-        # Generate differential attention frames
-        self._diff_attn_frames = []
-        for step, data in self.diff_attn_data:
-            frame = self.create_diff_attention_grid(
-                data['attn1'], data['attn2'], step, self._num_registers
-            )
-            self._diff_attn_frames.append((step, frame))
-            pbar.update(1)
+            # Submit differential attention frame tasks
+            diff_futures = []
+            for step, data in self.diff_attn_data:
+                future = executor.submit(_render_diff_attention_grid,
+                                        (step, data['attn1'], data['attn2'], self._num_registers))
+                diff_futures.append(future)
 
-        # Generate entropy frames
-        self._entropy_frames = []
-        for step, entropy_np in self.entropy_data:
-            frame = self.create_entropy_chart_from_numpy(entropy_np, step)
-            self._entropy_frames.append((step, frame))
-            pbar.update(1)
+            # Submit entropy frame tasks
+            entropy_futures = []
+            for step, entropy_np in self.entropy_data:
+                future = executor.submit(_render_entropy_chart, (step, entropy_np))
+                entropy_futures.append(future)
 
-        # Generate similarity frames
-        self._similarity_frames = []
-        for step, sim_np in self.similarity_data:
-            frame = self.create_similarity_matrix_from_numpy(sim_np, step)
-            self._similarity_frames.append((step, frame))
-            pbar.update(1)
+            # Submit similarity frame tasks
+            sim_futures = []
+            for step, sim_np in self.similarity_data:
+                future = executor.submit(_render_similarity_matrix, (step, sim_np))
+                sim_futures.append(future)
 
-        # Generate sample frames
+            # Collect attention frames
+            self._attention_frames = []
+            for future in attn_futures:
+                step, frame = future.result()
+                self._attention_frames.append((step, frame))
+                pbar.update(1)
+
+            # Collect differential attention frames
+            self._diff_attn_frames = []
+            for future in diff_futures:
+                step, frame = future.result()
+                self._diff_attn_frames.append((step, frame))
+                pbar.update(1)
+
+            # Collect entropy frames
+            self._entropy_frames = []
+            for future in entropy_futures:
+                step, frame = future.result()
+                self._entropy_frames.append((step, frame))
+                pbar.update(1)
+
+            # Collect similarity frames
+            self._similarity_frames = []
+            for future in sim_futures:
+                step, frame = future.result()
+                self._similarity_frames.append((step, frame))
+                pbar.update(1)
+
+        # Generate sample frames (sequential - usually few frames)
         self._sample_frames = []
         for step, samples_np in self.sample_data:
             frame = self.create_sample_grid(samples_np, step)
