@@ -621,6 +621,8 @@ def main(args):
                             if use_diff_attn and isinstance(attn_weights, dict):
                                 attn1_viz = attn_weights['attn1'][0]
                                 attn2_viz = attn_weights['attn2'][0]
+                                # Store both: regular attention grid AND differential comparison
+                                visualizer.store_attention_data(attn1_viz, train_steps, num_registers)
                                 visualizer.store_diff_attention_data(attn1_viz, attn2_viz, train_steps, num_registers)
                             else:
                                 attn_for_viz = attn_weights[0] if attn_weights.dim() == 4 else attn_weights
