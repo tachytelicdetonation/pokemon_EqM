@@ -1,7 +1,7 @@
 {
   "model": "EqM-B/2",
   "device": "cuda",
-  "image_size": 512,
+  "image_size": 256,
   "batch_size": 32,
   "epochs": 80,
   "log_every": 100,
@@ -53,7 +53,7 @@
   "matrix_lambda_scale": 1.0,
   "matrix_lambda_use_qk": true,
   "compute_attention_metrics": true,
-  "attention_viz_every": 1,
+  "attention_viz_every": 10,
   "attention_sparsity_threshold": 0.01,
   "attention_top_k": 5,
 

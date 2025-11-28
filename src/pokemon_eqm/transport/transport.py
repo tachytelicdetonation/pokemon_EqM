@@ -254,10 +254,8 @@ class Transport:
         if "return_act" in model_kwargs and model_kwargs['return_act']:
             if self.use_sigreg or self.use_aux_losses:
                 if self.use_sigreg and self.use_aux_losses:
-                    model_output, act, registers_or_aux = model_output
-                    # Note: with both enabled, we need to handle the combined return
-                    registers = registers_or_aux if not isinstance(registers_or_aux, dict) else None
-                    aux_info = registers_or_aux if isinstance(registers_or_aux, dict) else None
+                    # Model returns 4 values: (output, act, registers, aux_info)
+                    model_output, act, registers, aux_info = model_output
                 elif self.use_sigreg:
                     model_output, act, registers = model_output
                 else:  # use_aux_losses only
@@ -270,10 +268,8 @@ class Transport:
                 model_output, registers = model_output
             elif self.use_aux_losses and not self.use_sigreg:
                 model_output, aux_info = model_output
-            else:  # Both enabled - aux_info contains everything
-                model_output, aux_info = model_output
-                # If aux_info is a dict and model was called with return_registers,
-                # registers might be in a separate return - but we'll use aux_info for aux losses
+            else:  # Both enabled - model returns (output, registers, aux_info)
+                model_output, registers, aux_info = model_output
 
         # Compute SIGReg loss on register tokens
         if self.use_sigreg and registers is not None:
