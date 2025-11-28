@@ -59,6 +59,19 @@ class Transport:
         use_sigreg=False,
         sigreg_lambda=0.05,
         sigreg_num_slices=1024,
+        # Auxiliary losses for attention improvement (2025 research)
+        use_aux_losses=False,
+        aux_entropy_floor_threshold=0.3,
+        aux_entropy_floor_weight=0.02,
+        aux_entropy_ceiling_threshold=0.85,
+        aux_entropy_ceiling_weight=0.02,
+        aux_gate_entropy_weight=0.01,
+        aux_gate_sparsity_weight=0.005,
+        aux_hsic_weight=0.01,
+        aux_position_disagreement_weight=0.005,
+        aux_lambda_smoothness_weight=0.001,
+        aux_lambda_entropy_weight=0.01,
+        aux_warmup_steps=1000,
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -82,6 +95,26 @@ class Transport:
                 num_slices=sigreg_num_slices
             )
             logging.info(f"SIGReg initialized with lambda={sigreg_lambda}, slices={sigreg_num_slices}")
+
+        # Auxiliary losses initialization (2025 research: σReparam, GateRA, HSIC, D-Gating)
+        self.use_aux_losses = use_aux_losses
+        if use_aux_losses:
+            from pokemon_eqm.losses import AuxiliaryLossComputer
+            self.aux_loss_computer = AuxiliaryLossComputer(
+                entropy_floor_threshold=aux_entropy_floor_threshold,
+                entropy_floor_weight=aux_entropy_floor_weight,
+                entropy_ceiling_threshold=aux_entropy_ceiling_threshold,
+                entropy_ceiling_weight=aux_entropy_ceiling_weight,
+                gate_entropy_weight=aux_gate_entropy_weight,
+                gate_sparsity_weight=aux_gate_sparsity_weight,
+                hsic_weight=aux_hsic_weight,
+                position_disagreement_weight=aux_position_disagreement_weight,
+                lambda_smoothness_weight=aux_lambda_smoothness_weight,
+                lambda_entropy_weight=aux_lambda_entropy_weight,
+                warmup_steps=aux_warmup_steps,
+            )
+            logging.info(f"Auxiliary losses initialized (entropy: {aux_entropy_floor_weight}/{aux_entropy_ceiling_weight}, "
+                        f"gate: {aux_gate_entropy_weight}/{aux_gate_sparsity_weight}, hsic: {aux_hsic_weight})")
 
     def prior_logp(self, z):
         '''
@@ -184,13 +217,15 @@ class Transport:
         self,
         model,
         x1,
-        model_kwargs=None
+        model_kwargs=None,
+        train_step=0,  # For auxiliary loss warmup
     ):
         """Loss for training the score model
         Args:
         - model: backbone model; could be score, noise, or velocity
         - x1: datapoint
         - model_kwargs: additional arguments for the model
+        - train_step: current training step (for auxiliary loss warmup)
         """
         if model_kwargs == None:
             model_kwargs = {}
@@ -199,27 +234,86 @@ class Transport:
         if self.use_sigreg:
             model_kwargs['return_registers'] = True
 
+        # Request auxiliary info if aux losses are enabled
+        if self.use_aux_losses:
+            model_kwargs['return_aux_info'] = True
+            model_kwargs['attention_layer_idx'] = -1  # Last layer (or could use middle layer)
+
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         ut = ut * self.get_ct(t)[:,None,None,None] # use energy-compatible target
         model_output = model(xt, t, **model_kwargs)
         disp_loss = 0
         sigreg_loss_value = 0
+        aux_loss_dict = {}
+        aux_loss_total = 0
         registers = None
+        aux_info = None
 
         # get intermediate activation and apply Dispersive Loss
         if "return_act" in model_kwargs and model_kwargs['return_act']:
-            if self.use_sigreg:
-                model_output, act, registers = model_output
+            if self.use_sigreg or self.use_aux_losses:
+                if self.use_sigreg and self.use_aux_losses:
+                    model_output, act, registers_or_aux = model_output
+                    # Note: with both enabled, we need to handle the combined return
+                    registers = registers_or_aux if not isinstance(registers_or_aux, dict) else None
+                    aux_info = registers_or_aux if isinstance(registers_or_aux, dict) else None
+                elif self.use_sigreg:
+                    model_output, act, registers = model_output
+                else:  # use_aux_losses only
+                    model_output, act, aux_info = model_output
             else:
                 model_output, act = model_output
             disp_loss = self.disp_loss(act[len(act)-1])
-        elif self.use_sigreg:
-            model_output, registers = model_output
+        elif self.use_sigreg or self.use_aux_losses:
+            if self.use_sigreg and not self.use_aux_losses:
+                model_output, registers = model_output
+            elif self.use_aux_losses and not self.use_sigreg:
+                model_output, aux_info = model_output
+            else:  # Both enabled - aux_info contains everything
+                model_output, aux_info = model_output
+                # If aux_info is a dict and model was called with return_registers,
+                # registers might be in a separate return - but we'll use aux_info for aux losses
 
         # Compute SIGReg loss on register tokens
         if self.use_sigreg and registers is not None:
             sigreg_loss_value = self.sigreg_loss(registers)
+
+        # Compute auxiliary losses (entropy, gate, diversity, lambda regularization)
+        if self.use_aux_losses and aux_info is not None:
+            # Extract components from aux_info dict
+            attn_weights = None
+            head_outputs = None
+            gate_values = None
+            lambda_matrix = None
+            entropy_normalized = None
+
+            if isinstance(aux_info, dict):
+                # For DifferentialAttention: aux_info has 'attn1', 'attn2', 'head_outputs', 'gate_values', 'lambda_matrix'
+                attn_weights = aux_info.get('attn1', aux_info.get('attn', None))
+                head_outputs = aux_info.get('head_outputs', None)
+                gate_values = aux_info.get('gate_values', None)
+                lambda_matrix = aux_info.get('lambda_matrix', None)
+
+                # Compute entropy from attention weights if available
+                if attn_weights is not None:
+                    # Compute normalized entropy: H / log(N)
+                    eps = 1e-7
+                    attn_for_entropy = attn_weights.clamp(eps, 1 - eps)
+                    entropy_per_head = -th.sum(attn_for_entropy * th.log(attn_for_entropy), dim=-1)  # [B, H, N]
+                    max_entropy = th.log(th.tensor(attn_weights.shape[-1], dtype=attn_weights.dtype, device=attn_weights.device))
+                    entropy_normalized = (entropy_per_head / max_entropy).mean()
+
+            # Compute all aux losses
+            aux_loss_dict = self.aux_loss_computer(
+                train_step=train_step,
+                attn_weights=attn_weights,
+                head_outputs=head_outputs,
+                gate_values=gate_values,
+                lambda_matrix=lambda_matrix,
+                entropy_normalized=entropy_normalized,
+            )
+            aux_loss_total = aux_loss_dict.get('total', 0)
 
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
@@ -245,10 +339,17 @@ class Transport:
             else:
                 terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
 
-        # Add auxiliary losses
-        terms['loss'] += 0.5 * disp_loss + self.sigreg_lambda * sigreg_loss_value
+        # Add auxiliary losses (dispersive + SIGReg + attention aux losses)
+        terms['loss'] += 0.5 * disp_loss + self.sigreg_lambda * sigreg_loss_value + aux_loss_total
         terms['disp_loss'] = disp_loss
         terms['sigreg_loss'] = sigreg_loss_value
+
+        # Add individual aux loss components for logging
+        for key, value in aux_loss_dict.items():
+            if key != 'total':
+                terms[f'aux_{key}'] = value if th.is_tensor(value) else th.tensor(value)
+        terms['aux_loss_total'] = aux_loss_total if th.is_tensor(aux_loss_total) else th.tensor(aux_loss_total)
+
         return terms
     
 

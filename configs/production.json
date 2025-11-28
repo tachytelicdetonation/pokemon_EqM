@@ -55,5 +55,24 @@
   "compute_attention_metrics": true,
   "attention_viz_every": 1,
   "attention_sparsity_threshold": 0.01,
-  "attention_top_k": 5
+  "attention_top_k": 5,
+
+  "use_aux_losses": true,
+  "aux_entropy_floor_threshold": 0.3,
+  "aux_entropy_floor_weight": 0.02,
+  "aux_entropy_ceiling_threshold": 0.85,
+  "aux_entropy_ceiling_weight": 0.02,
+  "aux_gate_entropy_weight": 0.01,
+  "aux_gate_sparsity_weight": 0.005,
+  "aux_hsic_weight": 0.01,
+  "aux_position_disagreement_weight": 0.005,
+  "aux_lambda_smoothness_weight": 0.001,
+  "aux_lambda_entropy_weight": 0.01,
+  "aux_hard_focus_weight": 0.02,
+  "aux_complexity_diversity_weight": 0.01,
+  "aux_warmup_steps": 1000,
+
+  "use_complexity_bias": true,
+  "complexity_method": "variance",
+  "complexity_bias_scale": 1.0
 }

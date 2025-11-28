@@ -384,6 +384,19 @@ def main(args):
         use_sigreg=getattr(args, 'use_sigreg', False),
         sigreg_lambda=getattr(args, 'sigreg_lambda', 0.05),
         sigreg_num_slices=getattr(args, 'sigreg_num_slices', 1024),
+        # Auxiliary attention losses (2025 research)
+        use_aux_losses=getattr(args, 'use_aux_losses', False),
+        aux_entropy_floor_threshold=getattr(args, 'aux_entropy_floor_threshold', 0.3),
+        aux_entropy_floor_weight=getattr(args, 'aux_entropy_floor_weight', 0.02),
+        aux_entropy_ceiling_threshold=getattr(args, 'aux_entropy_ceiling_threshold', 0.85),
+        aux_entropy_ceiling_weight=getattr(args, 'aux_entropy_ceiling_weight', 0.02),
+        aux_gate_entropy_weight=getattr(args, 'aux_gate_entropy_weight', 0.01),
+        aux_gate_sparsity_weight=getattr(args, 'aux_gate_sparsity_weight', 0.005),
+        aux_hsic_weight=getattr(args, 'aux_hsic_weight', 0.01),
+        aux_position_disagreement_weight=getattr(args, 'aux_position_disagreement_weight', 0.005),
+        aux_lambda_smoothness_weight=getattr(args, 'aux_lambda_smoothness_weight', 0.001),
+        aux_lambda_entropy_weight=getattr(args, 'aux_lambda_entropy_weight', 0.01),
+        aux_warmup_steps=getattr(args, 'aux_warmup_steps', 1000),
     )  # default: velocity; 
     transport_sampler = Sampler(transport)
     
@@ -496,7 +509,7 @@ def main(args):
             opt.zero_grad()
             
             with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=(mixed_precision != "no")):
-                loss_dict = transport.training_losses(model, x, model_kwargs)
+                loss_dict = transport.training_losses(model, x, model_kwargs, train_step=train_steps)
                 loss = loss_dict["loss"].mean()
             
             scaler.scale(loss).backward()
@@ -566,6 +579,18 @@ def main(args):
                 if 'disp_loss' in loss_dict:
                     disp_val = loss_dict['disp_loss']
                     log_dict["train/disp_loss"] = disp_val.item() if torch.is_tensor(disp_val) else disp_val
+
+                # Add auxiliary attention losses if available (2025 research)
+                aux_loss_keys = [
+                    'aux_entropy_floor', 'aux_entropy_ceiling',
+                    'aux_gate_entropy', 'aux_gate_sparsity',
+                    'aux_hsic', 'aux_position_disagreement',
+                    'aux_lambda_smoothness', 'aux_lambda_entropy', 'aux_total'
+                ]
+                for key in aux_loss_keys:
+                    if key in loss_dict:
+                        val = loss_dict[key]
+                        log_dict[f"train/{key}"] = val.item() if torch.is_tensor(val) else val
 
                 # Compute attention metrics (every step) and store viz data (periodically)
                 attention_viz_every = getattr(args, 'attention_viz_every', 50)  # Store viz data every N steps

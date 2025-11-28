@@ -64,6 +64,146 @@ def compute_spatial_decay_bias(dimensions, device, dtype, decay_rate=0.1, decay_
     return spatial_bias.to(dtype=dtype).unsqueeze(0).unsqueeze(0)  # [1, 1, N, N]
 
 
+def compute_patch_complexity(
+    x: torch.Tensor,
+    method: str = 'variance',
+    num_registers: int = 0,
+    normalize: bool = True,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    Compute per-patch complexity scores to guide attention toward hard regions.
+
+    Based on 2024-2025 research on anti-curriculum learning and hardness-aware training:
+    - HARDY-MER (arXiv:2508.06800): Multi-view hardness evaluation
+    - TIACBM (ACL 2025): Task-informed anti-curriculum
+
+    Higher complexity = harder to model = should receive more attention.
+
+    Args:
+        x: Input tensor [B, N, C] (patch embeddings)
+        method: Complexity estimation method:
+            - 'variance': Per-patch feature variance (simple, effective)
+            - 'gradient': Gradient magnitude between adjacent patches
+            - 'entropy': Shannon entropy of feature distribution
+            - 'combined': Weighted combination of all methods
+        num_registers: Number of register tokens to skip (always complexity=1)
+        normalize: Normalize to [0, 1] range per sample
+        temperature: Temperature for softmax-style normalization (higher = sharper)
+
+    Returns:
+        Complexity scores [B, N] in [0, 1] range (higher = more complex/harder)
+    """
+    B, N, C = x.shape
+
+    # Handle register tokens (they always get complexity=1 to not be penalized)
+    if num_registers > 0:
+        x_patches = x[:, num_registers:]  # [B, N-num_reg, C]
+    else:
+        x_patches = x
+
+    N_patches = x_patches.shape[1]
+
+    if method == 'variance':
+        # Feature variance per patch - higher variance = more information
+        complexity = x_patches.var(dim=-1)  # [B, N_patches]
+
+    elif method == 'gradient':
+        # Gradient magnitude - high gradient = edge/detail region
+        # Reshape to 2D grid for spatial gradients
+        side = int(N_patches ** 0.5)
+        if side * side == N_patches:
+            x_2d = x_patches.view(B, side, side, C)
+            # Sobel-like gradient approximation
+            grad_x = (x_2d[:, :, 1:, :] - x_2d[:, :, :-1, :]).abs().mean(dim=-1)  # [B, H, W-1]
+            grad_y = (x_2d[:, 1:, :, :] - x_2d[:, :-1, :, :]).abs().mean(dim=-1)  # [B, H-1, W]
+            # Pad to original size - grad_x needs padding on dim 2, grad_y on dim 1
+            grad_x = F.pad(grad_x, (0, 1), mode='replicate')  # [B, H, W]
+            grad_y = F.pad(grad_y, (0, 0, 0, 1), mode='replicate')  # [B, H, W]
+            complexity = (grad_x + grad_y).view(B, N_patches)
+        else:
+            # Fallback to 1D gradient for non-square
+            grad = (x_patches[:, 1:, :] - x_patches[:, :-1, :]).abs().mean(dim=-1)
+            complexity = F.pad(grad, (0, 1), mode='replicate')
+
+    elif method == 'entropy':
+        # Shannon entropy of softmax-normalized features
+        # Higher entropy = more distributed features = more complex
+        eps = 1e-7
+        probs = F.softmax(x_patches / temperature, dim=-1)  # [B, N_patches, C]
+        entropy = -torch.sum(probs * torch.log(probs + eps), dim=-1)  # [B, N_patches]
+        complexity = entropy
+
+    elif method == 'combined':
+        # Weighted combination of all methods
+        var_score = x_patches.var(dim=-1)
+        # Simple gradient approximation
+        grad = torch.zeros(B, N_patches, device=x.device, dtype=x.dtype)
+        grad[:, 1:] = (x_patches[:, 1:, :] - x_patches[:, :-1, :]).abs().mean(dim=-1)
+        grad[:, 0] = grad[:, 1]
+        # Entropy
+        eps = 1e-7
+        probs = F.softmax(x_patches / temperature, dim=-1)
+        entropy = -torch.sum(probs * torch.log(probs + eps), dim=-1)
+        # Normalize each and combine
+        var_norm = (var_score - var_score.min(dim=-1, keepdim=True)[0]) / (var_score.max(dim=-1, keepdim=True)[0] - var_score.min(dim=-1, keepdim=True)[0] + eps)
+        grad_norm = (grad - grad.min(dim=-1, keepdim=True)[0]) / (grad.max(dim=-1, keepdim=True)[0] - grad.min(dim=-1, keepdim=True)[0] + eps)
+        entropy_norm = (entropy - entropy.min(dim=-1, keepdim=True)[0]) / (entropy.max(dim=-1, keepdim=True)[0] - entropy.min(dim=-1, keepdim=True)[0] + eps)
+        complexity = 0.4 * var_norm + 0.4 * grad_norm + 0.2 * entropy_norm
+
+    else:
+        raise ValueError(f"Unknown complexity method: {method}")
+
+    # Normalize to [0, 1]
+    if normalize:
+        min_c = complexity.min(dim=-1, keepdim=True)[0]
+        max_c = complexity.max(dim=-1, keepdim=True)[0]
+        complexity = (complexity - min_c) / (max_c - min_c + 1e-7)
+
+    # Handle register tokens - they always get max complexity (1.0)
+    if num_registers > 0:
+        reg_complexity = torch.ones(B, num_registers, device=x.device, dtype=x.dtype)
+        complexity = torch.cat([reg_complexity, complexity], dim=1)
+
+    return complexity
+
+
+def compute_complexity_attention_bias(
+    complexity: torch.Tensor,
+    scale: float = 1.0,
+    mode: str = 'additive',
+) -> torch.Tensor:
+    """
+    Convert patch complexity scores to attention bias.
+
+    Biases attention toward high-complexity (hard) patches and away from
+    low-complexity (easy) patches. Based on anti-curriculum learning research.
+
+    Args:
+        complexity: Per-patch complexity [B, N] in [0, 1]
+        scale: Scaling factor for bias strength
+        mode: Bias mode:
+            - 'additive': Add bias to attention logits (softer)
+            - 'multiplicative': Scale attention logits (sharper)
+
+    Returns:
+        Attention bias [B, 1, 1, N] for broadcasting to [B, H, N_q, N_k]
+    """
+    # Higher complexity = higher bias = more attention
+    if mode == 'additive':
+        # Shift complexity to [-0.5, 0.5] range, then scale
+        # This penalizes low-complexity keys and boosts high-complexity ones
+        bias = (complexity - 0.5) * scale
+    elif mode == 'multiplicative':
+        # Use as a multiplicative factor (complexity as soft mask)
+        bias = complexity * scale
+    else:
+        raise ValueError(f"Unknown bias mode: {mode}")
+
+    # Reshape for attention broadcasting: [B, 1, 1, N]
+    return bias.unsqueeze(1).unsqueeze(2)
+
+
 def compute_per_head_spatial_decay_bias(
     dimensions, device, dtype, num_heads,
     base_decay_rate=0.1, base_decay_radius=0.25, num_registers=0,
@@ -236,6 +376,59 @@ class LearnedSpatialDecay(nn.Module):
             return decay_sym * dist.unsqueeze(0).unsqueeze(0) * alpha
 
 
+class SigmaReparam(nn.Module):
+    """
+    Spectral reparametrization for QKV projections (σReparam from Apple/ICLR 2025).
+
+    Bounds the spectral norm of weight matrices to prevent attention entropy collapse.
+    Uses power iteration for efficient spectral norm estimation.
+
+    The key insight is that bounding ||W||_2 bounds ||QK^T||_F which bounds the maximum
+    attention logit, preventing entropy collapse even without explicit entropy losses.
+
+    Reference: "Stabilizing Transformer Training by Preventing Attention Entropy Collapse"
+               Apple ML Research / ICLR 2025
+    """
+    def __init__(self, linear: nn.Linear, target_sigma: float = 1.0, n_power_iterations: int = 1):
+        """
+        Args:
+            linear: The linear layer to wrap (typically QKV projection)
+            target_sigma: Target spectral norm (default 1.0)
+            n_power_iterations: Number of power iterations for spectral norm estimation
+        """
+        super().__init__()
+        self.linear = linear
+        self.target_sigma = target_sigma
+        self.n_power_iterations = n_power_iterations
+
+        # Initialize singular vectors for power iteration
+        h, w = linear.weight.shape
+        self.register_buffer('u', F.normalize(torch.randn(h), dim=0))
+        self.register_buffer('v', F.normalize(torch.randn(w), dim=0))
+
+    def _compute_spectral_norm(self):
+        """Compute spectral norm via power iteration."""
+        weight = self.linear.weight
+        u, v = self.u, self.v
+
+        with torch.no_grad():
+            for _ in range(self.n_power_iterations):
+                v = F.normalize(torch.mv(weight.t(), u), dim=0)
+                u = F.normalize(torch.mv(weight, v), dim=0)
+            self.u.copy_(u)
+            self.v.copy_(v)
+
+        # Compute spectral norm: sigma = u^T @ W @ v
+        sigma = torch.dot(u, torch.mv(weight, v))
+        return sigma
+
+    def forward(self, x):
+        """Apply spectral-normalized linear transformation."""
+        sigma = self._compute_spectral_norm()
+        scale = self.target_sigma / (sigma + 1e-8)
+        return F.linear(x, self.linear.weight * scale, self.linear.bias)
+
+
 class OutputGate(nn.Module):
     """
     G1 Output Gating for Attention Sink Elimination.
@@ -292,7 +485,7 @@ class OutputGate(nn.Module):
         if hasattr(self, 'gate_proj'):
             nn.init.normal_(self.gate_proj.weight, std=0.01)
 
-    def forward(self, q, out, num_registers=0):
+    def forward(self, q, out, num_registers=0, return_gate=False):
         """
         Compute and apply output gate.
 
@@ -300,9 +493,11 @@ class OutputGate(nn.Module):
             q: Query tensor [B, num_heads, N, head_dim]
             out: Attention output [B, num_heads, N, out_dim]
             num_registers: Number of register tokens (always get gate=1, no suppression)
+            return_gate: If True, also return gate values for auxiliary losses
 
         Returns:
             Gated output [B, num_heads, N, out_dim]
+            If return_gate=True: tuple of (gated_output, gate_values [B, H, N])
         """
         B, num_heads, N, _ = q.shape
 
@@ -329,9 +524,16 @@ class OutputGate(nn.Module):
             gate = gate.clone()
             gate[:, :, :num_registers] = 1.0
 
+        # Store gate values before adding dimension (for aux loss computation)
+        gate_values = gate  # [B, H, N]
+
         # Apply gate to output
         gate = gate.unsqueeze(-1)  # [B, H, N, 1]
-        return out * gate
+        gated_out = out * gate
+
+        if return_gate:
+            return gated_out, gate_values
+        return gated_out
 
 
 class MatrixGatedLambda(nn.Module):
@@ -781,6 +983,13 @@ class Attention(nn.Module):
         use_output_gate=False,  # G1 output gating for attention sink elimination
         output_gate_type='per_token',  # 'per_token', 'per_head', or 'global'
         output_gate_init_bias=-2.0,  # Initial bias (negative = conservative, gates start more open)
+        # σReparam for entropy collapse prevention (Apple/ICLR 2025)
+        use_sigma_reparam=False,
+        sigma_target=1.0,
+        # Complexity bias for anti-curriculum attention (HARDY-MER, TIACBM 2024-2025)
+        use_complexity_bias=False,  # Bias attention toward high-complexity patches
+        complexity_method='variance',  # 'variance', 'gradient', 'entropy', 'combined'
+        complexity_bias_scale=1.0,  # Scale for complexity bias strength
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -798,11 +1007,19 @@ class Attention(nn.Module):
         self.distance_type = distance_type
         self.use_content_gate = use_content_gate
         self.use_output_gate = use_output_gate
+        self.use_sigma_reparam = use_sigma_reparam
+        self.use_complexity_bias = use_complexity_bias
+        self.complexity_method = complexity_method
+        self.complexity_bias_scale = complexity_bias_scale
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+
+        # σReparam: Wrap QKV with spectral normalization (Apple/ICLR 2025)
+        if use_sigma_reparam:
+            self.qkv_reparam = SigmaReparam(self.qkv, target_sigma=sigma_target)
 
         # SDT-style learned spatial decay (replaces content gate when decay_type='learned')
         if decay_type == 'learned' and use_spatial_decay:
@@ -831,9 +1048,14 @@ class Attention(nn.Module):
                 pos_embed_rescale=liere_pos_embed_rescale
             )
 
-    def forward(self, x, return_attention=False):
+    def forward(self, x, return_attention=False, return_aux_info=False):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+
+        # Use σReparam QKV if enabled (for entropy collapse prevention)
+        if self.use_sigma_reparam:
+            qkv = self.qkv_reparam(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        else:
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
         if self.use_liere:
@@ -899,6 +1121,18 @@ class Attention(nn.Module):
                 )
             attn = attn + spatial_bias
 
+        # Apply complexity bias to focus on hard patches (anti-curriculum attention)
+        patch_complexity = None
+        if self.use_complexity_bias:
+            patch_complexity = compute_patch_complexity(
+                x, method=self.complexity_method,
+                num_registers=self.num_registers, normalize=True
+            )
+            complexity_bias = compute_complexity_attention_bias(
+                patch_complexity, scale=self.complexity_bias_scale, mode='additive'
+            )
+            attn = attn + complexity_bias
+
         attn = attn.softmax(dim=-1)
         attn_weights = attn  # Save for visualization before dropout
         attn = self.attn_drop(attn)
@@ -906,16 +1140,31 @@ class Attention(nn.Module):
         # Compute attention output
         out = attn @ v  # [B, num_heads, N, head_dim]
 
+        # Store head outputs before gating (for HSIC diversity loss)
+        head_outputs = out  # [B, num_heads, N, head_dim]
+
         # Apply G1 output gating if enabled (attention sink elimination)
+        gate_values = None
         if self.use_output_gate:
-            out = self.output_gate(q, out, num_registers=self.num_registers)
+            if return_aux_info:
+                out, gate_values = self.output_gate(q, out, num_registers=self.num_registers, return_gate=True)
+            else:
+                out = self.output_gate(q, out, num_registers=self.num_registers)
 
         x = out.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
-        if return_attention:
-            return x, attn_weights
+        if return_attention or return_aux_info:
+            result = attn_weights
+            if return_aux_info:
+                result = {
+                    'attn': attn_weights,
+                    'head_outputs': head_outputs,
+                    'gate_values': gate_values,
+                    'patch_complexity': patch_complexity,
+                }
+            return x, result
         return x
 
 
@@ -988,6 +1237,13 @@ class DifferentialAttention(nn.Module):
         use_output_gate=False,  # G1 output gating for attention sink elimination
         output_gate_type='per_token',  # 'per_token', 'per_head', or 'global'
         output_gate_init_bias=-2.0,  # Initial bias (negative = conservative, gates start more open)
+        # σReparam for entropy collapse prevention (Apple/ICLR 2025)
+        use_sigma_reparam=False,
+        sigma_target=1.0,
+        # Complexity bias for anti-curriculum attention (HARDY-MER, TIACBM 2024-2025)
+        use_complexity_bias=False,  # Bias attention toward high-complexity patches
+        complexity_method='variance',  # 'variance', 'gradient', 'entropy', 'combined'
+        complexity_bias_scale=1.0,  # Scale for complexity bias strength
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -1010,12 +1266,20 @@ class DifferentialAttention(nn.Module):
         self.matrix_lambda_scale = matrix_lambda_scale
         self.matrix_lambda_use_qk = matrix_lambda_use_qk
         self.use_output_gate = use_output_gate
+        self.use_sigma_reparam = use_sigma_reparam
+        self.use_complexity_bias = use_complexity_bias
+        self.complexity_method = complexity_method
+        self.complexity_bias_scale = complexity_bias_scale
 
         # Q, K, V projections (same total dimension as standard attention)
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+
+        # σReparam: Wrap QKV with spectral normalization (Apple/ICLR 2025)
+        if use_sigma_reparam:
+            self.qkv_reparam = SigmaReparam(self.qkv, target_sigma=sigma_target)
 
         # SDT-style learned spatial decay or content-aware gate
         if decay_type == 'learned' and use_spatial_decay:
@@ -1067,11 +1331,14 @@ class DifferentialAttention(nn.Module):
                 gate_type=output_gate_type
             )
 
-    def forward(self, x, return_attention=False):
+    def forward(self, x, return_attention=False, return_aux_info=False):
         B, N, C = x.shape
 
-        # Project to Q, K, V
-        qkv = self.qkv(x).reshape(B, N, 3, C).permute(2, 0, 1, 3)
+        # Project to Q, K, V (use σReparam if enabled)
+        if self.use_sigma_reparam:
+            qkv = self.qkv_reparam(x).reshape(B, N, 3, C).permute(2, 0, 1, 3)
+        else:
+            qkv = self.qkv(x).reshape(B, N, 3, C).permute(2, 0, 1, 3)
         q, k, v = qkv[0], qkv[1], qkv[2]  # Each is [B, N, C]
 
         # Reshape for differential attention: split into 2*num_heads with head_dim each
@@ -1169,6 +1436,19 @@ class DifferentialAttention(nn.Module):
             attn1 = attn1 + spatial_bias
             attn2 = attn2 + spatial_bias
 
+        # Apply complexity bias to focus on hard patches (anti-curriculum attention)
+        patch_complexity = None
+        if self.use_complexity_bias:
+            patch_complexity = compute_patch_complexity(
+                x, method=self.complexity_method,
+                num_registers=self.num_registers, normalize=True
+            )
+            complexity_bias = compute_complexity_attention_bias(
+                patch_complexity, scale=self.complexity_bias_scale, mode='additive'
+            )
+            attn1 = attn1 + complexity_bias
+            attn2 = attn2 + complexity_bias
+
         attn1 = attn1.softmax(dim=-1)
         attn2 = attn2.softmax(dim=-1)
 
@@ -1200,10 +1480,17 @@ class DifferentialAttention(nn.Module):
             out = out1 - lambda_full * out2  # [B, num_heads, N, 2*head_dim]
             lambda_for_return = lambda_full
 
+        # Store head outputs before gating (for HSIC diversity loss)
+        head_outputs = out  # [B, num_heads, N, 2*head_dim]
+
         # Apply G1 output gating if enabled (attention sink elimination)
         # This allows the model to output "nothing" for positions where attention is uninformative
+        gate_values = None
         if self.use_output_gate:
-            out = self.output_gate(q1, out, num_registers=self.num_registers)
+            if return_aux_info:
+                out, gate_values = self.output_gate(q1, out, num_registers=self.num_registers, return_gate=True)
+            else:
+                out = self.output_gate(q1, out, num_registers=self.num_registers)
 
         # Apply sublayer normalization and scaling
         out = out.permute(0, 2, 1, 3)  # [B, N, num_heads, 2*head_dim]
@@ -1215,9 +1502,14 @@ class DifferentialAttention(nn.Module):
         out = self.proj(out)
         out = self.proj_drop(out)
 
-        if return_attention:
-            # Return both attention matrices for differential attention visualization
-            return out, {'attn1': attn1_weights, 'attn2': attn2_weights, 'lambda': lambda_for_return}
+        if return_attention or return_aux_info:
+            result = {'attn1': attn1_weights, 'attn2': attn2_weights, 'lambda': lambda_for_return}
+            if return_aux_info:
+                result['head_outputs'] = head_outputs
+                result['gate_values'] = gate_values
+                result['lambda_matrix'] = lambda_for_return if self.use_matrix_lambda else None
+                result['patch_complexity'] = patch_complexity
+            return out, result
         return out
 
 
@@ -1253,14 +1545,18 @@ class SiTBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
-    def forward(self, x, c, return_attention=False):
+    def forward(self, x, c, return_attention=False, return_aux_info=False):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
 
-        if return_attention:
-            attn_out, attn_weights = self.attn(modulate(self.norm1(x), shift_msa, scale_msa), return_attention=True)
+        if return_attention or return_aux_info:
+            attn_out, attn_info = self.attn(
+                modulate(self.norm1(x), shift_msa, scale_msa),
+                return_attention=return_attention,
+                return_aux_info=return_aux_info
+            )
             x = x + gate_msa.unsqueeze(1) * attn_out
             x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-            return x, attn_weights
+            return x, attn_info
         else:
             x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
             x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
@@ -1326,6 +1622,13 @@ class EqM(nn.Module):
         use_output_gate=False,  # G1 output gating for attention sink elimination (arXiv:2505.06708)
         output_gate_type='per_token',  # 'per_token', 'per_head', or 'global'
         output_gate_init_bias=-2.0,  # Initial bias (negative = conservative, gates start more open)
+        # σReparam for entropy collapse prevention (Apple/ICLR 2025)
+        use_sigma_reparam=False,
+        sigma_target=1.0,
+        # Complexity bias for anti-curriculum attention (HARDY-MER, TIACBM 2024-2025)
+        use_complexity_bias=False,
+        complexity_method='variance',
+        complexity_bias_scale=1.0,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -1373,6 +1676,11 @@ class EqM(nn.Module):
             use_output_gate=use_output_gate,
             output_gate_type=output_gate_type,
             output_gate_init_bias=output_gate_init_bias,
+            use_sigma_reparam=use_sigma_reparam,
+            sigma_target=sigma_target,
+            use_complexity_bias=use_complexity_bias,
+            complexity_method=complexity_method,
+            complexity_bias_scale=complexity_bias_scale,
         )
 
         # Create blocks with layer indices for differential attention lambda initialization
@@ -1443,7 +1751,7 @@ class EqM(nn.Module):
         return imgs
 
     def forward(self, x0, t, y, return_act=False, return_registers=False, get_energy=False, train=False,
-                return_attention=False, attention_layer_idx=-1):
+                return_attention=False, attention_layer_idx=-1, return_aux_info=False):
         """
         Forward pass of EqM.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -1452,6 +1760,7 @@ class EqM(nn.Module):
         return_registers: if True, also return the register token outputs for SIGReg
         return_attention: if True, also return attention weights from specified layer
         attention_layer_idx: which layer to extract attention from (-1 = last layer)
+        return_aux_info: if True, also return auxiliary info (head_outputs, gate_values, lambda_matrix) for aux losses
         """
         x0.requires_grad_(True)
         if self.uncond: # removes noise/time conditioning by setting to 0
@@ -1473,9 +1782,12 @@ class EqM(nn.Module):
         num_blocks = len(self.blocks)
         target_layer = attention_layer_idx if attention_layer_idx >= 0 else num_blocks + attention_layer_idx
 
+        aux_info = None
         for i, block in enumerate(self.blocks):
-            if return_attention and i == target_layer:
-                x, attention_weights = block(x, c, return_attention=True)
+            if (return_attention or return_aux_info) and i == target_layer:
+                x, block_info = block(x, c, return_attention=return_attention, return_aux_info=return_aux_info)
+                attention_weights = block_info  # For backward compatibility
+                aux_info = block_info  # Full auxiliary info
             else:
                 x = block(x, c)
             act.append(x)
@@ -1507,14 +1819,15 @@ class EqM(nn.Module):
                 x = torch.autograd.grad([E.sum()],[x0],create_graph=train)[0]
         if get_energy:
             return x, -E
-        if return_attention:
+        if return_attention or return_aux_info:
+            # Use aux_info which contains all info (attention weights + head outputs + gate values + lambda)
             if return_act:
                 if return_registers:
-                    return x, act, registers, attention_weights
-                return x, act, attention_weights
+                    return x, act, registers, aux_info
+                return x, act, aux_info
             if return_registers:
-                return x, registers, attention_weights
-            return x, attention_weights
+                return x, registers, aux_info
+            return x, aux_info
         if return_act:
             if return_registers:
                 return x, act, registers

@@ -10,6 +10,19 @@ def create_transport(
     use_sigreg=False,
     sigreg_lambda=0.05,
     sigreg_num_slices=1024,
+    # Auxiliary losses for attention improvement (2025 research)
+    use_aux_losses=False,
+    aux_entropy_floor_threshold=0.3,
+    aux_entropy_floor_weight=0.02,
+    aux_entropy_ceiling_threshold=0.85,
+    aux_entropy_ceiling_weight=0.02,
+    aux_gate_entropy_weight=0.01,
+    aux_gate_sparsity_weight=0.005,
+    aux_hsic_weight=0.01,
+    aux_position_disagreement_weight=0.005,
+    aux_lambda_smoothness_weight=0.001,
+    aux_lambda_entropy_weight=0.01,
+    aux_warmup_steps=1000,
 ):
     """function for creating Transport object
     **Note**: model prediction defaults to velocity
@@ -24,6 +37,18 @@ def create_transport(
     - use_sigreg: enable SIGReg loss on register tokens
     - sigreg_lambda: weight for SIGReg loss (default 0.05)
     - sigreg_num_slices: number of random projections for SIGReg (default 1024)
+    - use_aux_losses: enable auxiliary attention losses
+    - aux_entropy_floor_threshold: entropy floor for collapse prevention
+    - aux_entropy_floor_weight: weight for entropy floor loss
+    - aux_entropy_ceiling_threshold: entropy ceiling for uniformity prevention
+    - aux_entropy_ceiling_weight: weight for entropy ceiling loss
+    - aux_gate_entropy_weight: weight for gate binary entropy (GateRA)
+    - aux_gate_sparsity_weight: weight for gate sparsity (D-Gating)
+    - aux_hsic_weight: weight for HSIC head decorrelation
+    - aux_position_disagreement_weight: weight for position disagreement
+    - aux_lambda_smoothness_weight: weight for M-DGSA lambda smoothness
+    - aux_lambda_entropy_weight: weight for M-DGSA lambda entropy
+    - aux_warmup_steps: warmup steps for auxiliary losses
     """
 
     if prediction == "noise":
@@ -68,6 +93,19 @@ def create_transport(
         use_sigreg=use_sigreg,
         sigreg_lambda=sigreg_lambda,
         sigreg_num_slices=sigreg_num_slices,
+        # Auxiliary losses
+        use_aux_losses=use_aux_losses,
+        aux_entropy_floor_threshold=aux_entropy_floor_threshold,
+        aux_entropy_floor_weight=aux_entropy_floor_weight,
+        aux_entropy_ceiling_threshold=aux_entropy_ceiling_threshold,
+        aux_entropy_ceiling_weight=aux_entropy_ceiling_weight,
+        aux_gate_entropy_weight=aux_gate_entropy_weight,
+        aux_gate_sparsity_weight=aux_gate_sparsity_weight,
+        aux_hsic_weight=aux_hsic_weight,
+        aux_position_disagreement_weight=aux_position_disagreement_weight,
+        aux_lambda_smoothness_weight=aux_lambda_smoothness_weight,
+        aux_lambda_entropy_weight=aux_lambda_entropy_weight,
+        aux_warmup_steps=aux_warmup_steps,
     )
 
     return state
