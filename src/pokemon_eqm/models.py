@@ -1778,7 +1778,7 @@ class EqM(nn.Module):
         return imgs
 
     def forward(self, x0, t, y, return_act=False, return_registers=False, get_energy=False, train=False,
-                return_attention=False, attention_layer_idx=-1, return_aux_info=False):
+                return_attention=False, attention_layer_idx=-1, return_aux_info=False, return_embeddings=False):
         """
         Forward pass of EqM.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -1788,6 +1788,7 @@ class EqM(nn.Module):
         return_attention: if True, also return attention weights from specified layer
         attention_layer_idx: which layer to extract attention from (-1 = last layer)
         return_aux_info: if True, also return auxiliary info (head_outputs, gate_values, lambda_matrix) for aux losses
+        return_embeddings: if True, also return patch embeddings before final layer (for LejEPA)
         """
         x0.requires_grad_(True)
         if self.uncond: # removes noise/time conditioning by setting to 0
@@ -1821,9 +1822,14 @@ class EqM(nn.Module):
 
         # Split registers from patches before final layer
         registers = None
+        embeddings = None
         if self.num_registers > 0:
             registers = x[:, :self.num_registers]  # (N, num_reg, D)
             x = x[:, self.num_registers:]          # (N, T, D)
+
+        # Store embeddings before final layer (for LejEPA)
+        if return_embeddings:
+            embeddings = x.clone()  # (N, T, D)
 
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
@@ -1846,22 +1852,25 @@ class EqM(nn.Module):
                 x = torch.autograd.grad([E.sum()],[x0],create_graph=train)[0]
         if get_energy:
             return x, -E
-        if return_attention or return_aux_info:
-            # Use aux_info which contains all info (attention weights + head outputs + gate values + lambda)
-            if return_act:
-                if return_registers:
-                    return x, act, registers, aux_info
-                return x, act, aux_info
-            if return_registers:
-                return x, registers, aux_info
-            return x, aux_info
+        # Build return tuple based on requested outputs
+        # Order: (x, act, registers, embeddings, aux_info)
+        result = [x]
+
         if return_act:
-            if return_registers:
-                return x, act, registers
-            return x, act
+            result.append(act)
+
         if return_registers:
-            return x, registers
-        return x
+            result.append(registers)
+
+        if return_embeddings:
+            result.append(embeddings)
+
+        if return_attention or return_aux_info:
+            result.append(aux_info)
+
+        if len(result) == 1:
+            return result[0]
+        return tuple(result)
 
     def forward_with_cfg(self, x, t, y, cfg_scale, return_act=False, return_registers=False, get_energy=False, train=False):
         """

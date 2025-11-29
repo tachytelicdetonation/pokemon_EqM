@@ -17,6 +17,14 @@ except ImportError:
     LEJEPA_AVAILABLE = False
     logging.warning("lejepa package not installed. SIGReg loss will be unavailable.")
 
+# LejEPA loss module (enhanced SIGReg with prediction and invariance)
+try:
+    from pokemon_eqm.losses.lejepa_loss import LejEPALoss
+    LEJEPA_LOSS_AVAILABLE = True
+except ImportError:
+    LEJEPA_LOSS_AVAILABLE = False
+    logging.warning("LejEPA loss module not available.")
+
 class ModelType(enum.Enum):
     """
     Which type of output the model predicts.
@@ -79,6 +87,16 @@ class Transport:
         aux_complexity_diversity_weight=0.01,
         aux_complexity_ortho_weight=0.01,
         aux_load_balance_weight=0.005,
+        # LejEPA enhanced parameters
+        use_lejepa=False,
+        lejepa_sigreg_weight=0.05,
+        lejepa_invariance_weight=0.02,
+        lejepa_prediction_weight=0.1,
+        lejepa_use_invariance=True,
+        lejepa_use_prediction=True,
+        lejepa_predictor_dim=384,
+        lejepa_mask_ratio=0.6,
+        embed_dim=768,  # Model embedding dimension for predictor
     ):
         path_options = {
             PathType.LINEAR: path.ICPlan,
@@ -129,6 +147,26 @@ class Transport:
             logging.info(f"Auxiliary losses initialized (entropy: {aux_entropy_floor_weight}/{aux_entropy_ceiling_weight}, "
                         f"gate: {aux_gate_entropy_weight}/{aux_gate_sparsity_weight}, hsic: {aux_hsic_weight}, "
                         f"hard_focus: {aux_hard_focus_weight}, complexity_ortho: {aux_complexity_ortho_weight})")
+
+        # Enhanced LejEPA loss initialization
+        self.use_lejepa = use_lejepa and LEJEPA_LOSS_AVAILABLE
+        if self.use_lejepa:
+            self.lejepa_loss = LejEPALoss(
+                use_sigreg=True,
+                sigreg_weight=lejepa_sigreg_weight,
+                sigreg_num_slices=sigreg_num_slices,
+                sigreg_type='cf',  # Use efficient CF-SIGReg
+                use_invariance=lejepa_use_invariance,
+                invariance_weight=lejepa_invariance_weight,
+                use_prediction=lejepa_use_prediction,
+                prediction_weight=lejepa_prediction_weight,
+                embed_dim=embed_dim,
+                predictor_dim=lejepa_predictor_dim,
+                mask_ratio=lejepa_mask_ratio,
+                warmup_steps=aux_warmup_steps,
+            )
+            logging.info(f"LejEPA loss initialized (sigreg={lejepa_sigreg_weight}, "
+                        f"invariance={lejepa_invariance_weight}, prediction={lejepa_prediction_weight})")
 
     def prior_logp(self, z):
         '''
@@ -244,8 +282,8 @@ class Transport:
         if model_kwargs == None:
             model_kwargs = {}
 
-        # Request registers if SIGReg is enabled
-        if self.use_sigreg:
+        # Request registers if SIGReg or LejEPA is enabled
+        if self.use_sigreg or self.use_lejepa:
             model_kwargs['return_registers'] = True
 
         # Request auxiliary info if aux losses are enabled
@@ -253,41 +291,67 @@ class Transport:
             model_kwargs['return_aux_info'] = True
             model_kwargs['attention_layer_idx'] = -1  # Last layer (or could use middle layer)
 
+        # Request embeddings if LejEPA is enabled (for SIGReg on patch tokens)
+        if self.use_lejepa:
+            model_kwargs['return_embeddings'] = True
+
         t, x0, x1 = self.sample(x1)
         t, xt, ut = self.path_sampler.plan(t, x0, x1)
         ut = ut * self.get_ct(t)[:,None,None,None] # use energy-compatible target
         model_output = model(xt, t, **model_kwargs)
         disp_loss = 0
         sigreg_loss_value = 0
+        lejepa_loss_dict = {}
+        lejepa_loss_total = 0
         aux_loss_dict = {}
         aux_loss_total = 0
         registers = None
         aux_info = None
+        embeddings = None  # For LejEPA
 
-        # get intermediate activation and apply Dispersive Loss
-        if "return_act" in model_kwargs and model_kwargs['return_act']:
-            if self.use_sigreg or self.use_aux_losses:
-                if self.use_sigreg and self.use_aux_losses:
-                    # Model returns 4 values: (output, act, registers, aux_info)
-                    model_output, act, registers, aux_info = model_output
-                elif self.use_sigreg:
-                    model_output, act, registers = model_output
-                else:  # use_aux_losses only
-                    model_output, act, aux_info = model_output
-            else:
-                model_output, act = model_output
-            disp_loss = self.disp_loss(act[len(act)-1])
-        elif self.use_sigreg or self.use_aux_losses:
-            if self.use_sigreg and not self.use_aux_losses:
-                model_output, registers = model_output
-            elif self.use_aux_losses and not self.use_sigreg:
-                model_output, aux_info = model_output
-            else:  # Both enabled - model returns (output, registers, aux_info)
-                model_output, registers, aux_info = model_output
+        # Parse model outputs based on what was requested
+        # Model can return various combinations based on flags
+        if isinstance(model_output, tuple):
+            outputs = list(model_output)
+            model_output = outputs[0]
+            idx = 1
 
-        # Compute SIGReg loss on register tokens
-        if self.use_sigreg and registers is not None:
+            # Parse return_act
+            if "return_act" in model_kwargs and model_kwargs['return_act'] and idx < len(outputs):
+                act = outputs[idx]
+                idx += 1
+                disp_loss = self.disp_loss(act[len(act)-1])
+
+            # Parse return_registers
+            if model_kwargs.get('return_registers', False) and idx < len(outputs):
+                registers = outputs[idx]
+                idx += 1
+
+            # Parse return_embeddings (for LejEPA)
+            if model_kwargs.get('return_embeddings', False) and idx < len(outputs):
+                embeddings = outputs[idx]
+                idx += 1
+
+            # Parse return_aux_info
+            if model_kwargs.get('return_aux_info', False) and idx < len(outputs):
+                aux_info = outputs[idx]
+                idx += 1
+
+        # Compute SIGReg loss on register tokens (legacy approach)
+        if self.use_sigreg and registers is not None and not self.use_lejepa:
             sigreg_loss_value = self.sigreg_loss(registers)
+
+        # Compute enhanced LejEPA loss (replaces legacy SIGReg when enabled)
+        if self.use_lejepa:
+            lejepa_loss_dict = self.lejepa_loss(
+                embeddings=embeddings if embeddings is not None else registers,
+                registers=registers,
+                embeddings_view2=None,  # Multi-view handled in training script
+                target_embeddings=None,  # Self-prediction mode
+                train_step=train_step,
+                total_steps=100000,  # Will be passed from training script
+            )
+            lejepa_loss_total = lejepa_loss_dict.get('total', 0)
 
         # Compute auxiliary losses (entropy, gate, diversity, lambda regularization)
         if self.use_aux_losses and aux_info is not None:
@@ -359,10 +423,16 @@ class Transport:
             else:
                 terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
 
-        # Add auxiliary losses (dispersive + SIGReg + attention aux losses)
-        terms['loss'] += 0.5 * disp_loss + self.sigreg_lambda * sigreg_loss_value + aux_loss_total
+        # Add auxiliary losses (dispersive + SIGReg + LejEPA + attention aux losses)
+        terms['loss'] += 0.5 * disp_loss + self.sigreg_lambda * sigreg_loss_value + lejepa_loss_total + aux_loss_total
         terms['disp_loss'] = disp_loss
         terms['sigreg_loss'] = sigreg_loss_value
+
+        # Add LejEPA loss components for logging
+        for key, value in lejepa_loss_dict.items():
+            if key != 'total':
+                terms[f'lejepa_{key}'] = value if th.is_tensor(value) else th.tensor(value)
+        terms['lejepa_loss_total'] = lejepa_loss_total if th.is_tensor(lejepa_loss_total) else th.tensor(lejepa_loss_total)
 
         # Add individual aux loss components for logging
         for key, value in aux_loss_dict.items():

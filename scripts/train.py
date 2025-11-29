@@ -487,6 +487,17 @@ def main(args):
         aux_complexity_diversity_weight=getattr(args, "aux_complexity_diversity_weight", 0.01),
         aux_complexity_ortho_weight=getattr(args, "aux_complexity_ortho_weight", 0.01),
         aux_load_balance_weight=getattr(args, "aux_load_balance_weight", 0.005),
+        # LejEPA enhanced parameters (arXiv:2511.08544)
+        use_lejepa=getattr(args, "use_lejepa", False),
+        lejepa_sigreg_weight=getattr(args, "lejepa_sigreg_weight", 0.05),
+        lejepa_invariance_weight=getattr(args, "lejepa_invariance_weight", 0.02),
+        lejepa_prediction_weight=getattr(args, "lejepa_prediction_weight", 0.1),
+        lejepa_use_invariance=getattr(args, "lejepa_use_invariance", True),
+        lejepa_use_prediction=getattr(args, "lejepa_use_prediction", True),
+        lejepa_predictor_dim=getattr(args, "lejepa_predictor_dim", 384),
+        lejepa_mask_ratio=getattr(args, "lejepa_mask_ratio", 0.6),
+        # Model embedding dimension (derived from model config)
+        embed_dim=model.embed_dim if hasattr(model, "embed_dim") else 768,
     )  # default: velocity;
     transport_sampler = Sampler(transport)
 
@@ -691,6 +702,22 @@ def main(args):
                     log_dict["train/disp_loss"] = (
                         disp_val.item() if torch.is_tensor(disp_val) else disp_val
                     )
+
+                # Add LejEPA loss components if available
+                lejepa_loss_keys = [
+                    "lejepa_sigreg_patches",
+                    "lejepa_sigreg_registers",
+                    "lejepa_sigreg_total",
+                    "lejepa_invariance",
+                    "lejepa_prediction",
+                    "lejepa_loss_total",
+                ]
+                for key in lejepa_loss_keys:
+                    if key in loss_dict:
+                        val = loss_dict[key]
+                        log_dict[f"train/{key}"] = (
+                            val.item() if torch.is_tensor(val) else val
+                        )
 
                 # Add auxiliary attention losses if available (2025 research)
                 aux_loss_keys = [

@@ -30,6 +30,16 @@ def create_transport(
     aux_complexity_diversity_weight=0.01,
     aux_complexity_ortho_weight=0.01,
     aux_load_balance_weight=0.005,
+    # LejEPA enhanced parameters (arXiv:2511.08544)
+    use_lejepa=False,
+    lejepa_sigreg_weight=0.05,
+    lejepa_invariance_weight=0.02,
+    lejepa_prediction_weight=0.1,
+    lejepa_use_invariance=True,
+    lejepa_use_prediction=True,
+    lejepa_predictor_dim=384,
+    lejepa_mask_ratio=0.6,
+    embed_dim=768,  # Model embedding dimension
 ):
     """function for creating Transport object
     **Note**: model prediction defaults to velocity
@@ -61,6 +71,15 @@ def create_transport(
     - aux_complexity_diversity_weight: weight for complexity diversity loss
     - aux_complexity_ortho_weight: weight for complexity orthogonal loss
     - aux_load_balance_weight: weight for head load balancing loss
+    - use_lejepa: enable enhanced LejEPA loss (SIGReg + prediction + invariance)
+    - lejepa_sigreg_weight: weight for SIGReg on embeddings
+    - lejepa_invariance_weight: weight for multi-view invariance loss
+    - lejepa_prediction_weight: weight for JEPA prediction loss
+    - lejepa_use_invariance: enable invariance loss component
+    - lejepa_use_prediction: enable prediction loss component
+    - lejepa_predictor_dim: hidden dimension for predictor MLP
+    - lejepa_mask_ratio: fraction of patches to mask for prediction
+    - embed_dim: model embedding dimension (for predictor initialization)
     """
 
     if prediction == "noise":
@@ -124,6 +143,16 @@ def create_transport(
         aux_complexity_diversity_weight=aux_complexity_diversity_weight,
         aux_complexity_ortho_weight=aux_complexity_ortho_weight,
         aux_load_balance_weight=aux_load_balance_weight,
+        # LejEPA enhanced parameters
+        use_lejepa=use_lejepa,
+        lejepa_sigreg_weight=lejepa_sigreg_weight,
+        lejepa_invariance_weight=lejepa_invariance_weight,
+        lejepa_prediction_weight=lejepa_prediction_weight,
+        lejepa_use_invariance=lejepa_use_invariance,
+        lejepa_use_prediction=lejepa_use_prediction,
+        lejepa_predictor_dim=lejepa_predictor_dim,
+        lejepa_mask_ratio=lejepa_mask_ratio,
+        embed_dim=embed_dim,
     )
 
     return state

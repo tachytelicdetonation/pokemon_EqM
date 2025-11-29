@@ -78,5 +78,14 @@
   "complexity_method": "variance",
   "complexity_bias_scale": 1.0,
 
-  "use_head_routing": true
+  "use_head_routing": true,
+
+  "use_lejepa": true,
+  "lejepa_sigreg_weight": 0.05,
+  "lejepa_invariance_weight": 0.02,
+  "lejepa_prediction_weight": 0.1,
+  "lejepa_use_invariance": true,
+  "lejepa_use_prediction": true,
+  "lejepa_predictor_dim": 384,
+  "lejepa_mask_ratio": 0.6
 }
