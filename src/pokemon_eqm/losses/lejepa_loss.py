@@ -760,6 +760,11 @@ class LejEPALoss(nn.Module):
         """
         B, N, D = embeddings.shape
 
+        # Ensure predictor is on the same device as input
+        device = embeddings.device
+        if next(self.predictor.parameters()).device != device:
+            self.predictor = self.predictor.to(device)
+
         # Generate masks
         context_mask, target_mask = self.mask_generator(
             B, N, embeddings.device, training_progress

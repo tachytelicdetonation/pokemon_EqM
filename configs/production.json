@@ -2,7 +2,7 @@
   "model": "EqM-B/2",
   "device": "cuda",
   "image_size": 256,
-  "batch_size": 32,
+  "batch_size": 16,
   "epochs": 80,
   "log_every": 100,
   "ckpt_every": 1000,
