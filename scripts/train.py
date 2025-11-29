@@ -5,6 +5,7 @@
 A minimal training script for EqM (Single GPU/CPU).
 """
 
+import gc
 import torch
 
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
@@ -1148,11 +1149,20 @@ def main(args):
 
                         except Exception as e:
                             logger.warning(f"Failed to calculate FID for {name}: {e}")
+                        finally:
+                            # Clean up fake images tensor immediately
+                            if 'fake_imgs' in locals():
+                                del fake_imgs
 
                         # Reset metrics
                         fid_metric.reset()
 
-                # Clear CUDA cache after FID to prevent OOM during training resume
+                # Aggressive cleanup after FID loop to prevent OOM during training
+                if 'real_images_tensor' in locals() and real_images_tensor is not None:
+                    del real_images_tensor
+                if 'fake_imgs_np' in locals():
+                    del fake_imgs_np
+                gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
