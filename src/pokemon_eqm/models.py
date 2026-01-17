@@ -1791,8 +1791,8 @@ class EqM(nn.Module):
         return_embeddings: if True, also return patch embeddings before final layer (for LejEPA)
         """
         x0.requires_grad_(True)
-        if self.uncond: # removes noise/time conditioning by setting to 0
-            t = torch.zeros_like(t)
+        # if self.uncond: # removes noise/time conditioning by setting to 0
+        #     t = torch.zeros_like(t)
         act = []
         attention_weights = None
         x = self.x_embedder(x0) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
@@ -1903,8 +1903,8 @@ class EqM(nn.Module):
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
+        eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        # eps, rest = model_out[:, :3], model_out[:, 3:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
